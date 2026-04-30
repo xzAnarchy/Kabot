@@ -125,7 +125,19 @@ CREATE INDEX IF NOT EXISTS idx_membership_band_joined
 
 
 async def init_db() -> asyncpg.Pool:
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    # Neon y otros proveedores requieren SSL. asyncpg no acepta ?sslmode=require en la URL,
+    # así que lo quitamos y configuramos SSL aparte.
+    db_url = DATABASE_URL
+    ssl_required = False
+    if db_url and "sslmode=require" in db_url:
+        ssl_required = True
+        db_url = db_url.replace("?sslmode=require", "").replace("&sslmode=require", "")
+
+    kwargs = {"min_size": 1, "max_size": 5}
+    if ssl_required or (db_url and "neon.tech" in db_url):
+        kwargs["ssl"] = "require"
+
+    pool = await asyncpg.create_pool(db_url, **kwargs)
     async with pool.acquire() as conn:
         await conn.execute(SCHEMA_SQL)
     return pool
