@@ -1,17 +1,25 @@
 """
 Bot de Discord para asignar roles de banda con sistema de cooldowns y límites.
+Versión con SLASH COMMANDS (/).
 
 REGLAS:
 - Solicitar MIEMBRO (mensaje SIN palabra 'jefe'):
-    * Máx 5 asignaciones aprobadas por banda por semana (lunes 00:00 UTC).
-    * Cooldown 5d para otra banda, 4d para misma banda.
-    * No puede estar ya en otra banda.
+    * Máx 5 asignaciones aprobadas por banda por semana (lunes 00:00 UTC)
+    * Cooldown 5d para otra banda, 4d para misma banda
+    * No puede estar ya en otra banda
+    * Capacidad máxima de la banda (configurable por banda)
 
 - Solicitar JEFE (mensaje CON palabra 'jefe'):
-    * El usuario debe haber sido miembro de esa banda al menos 15 días
-      (sumando todas sus membresías de MIEMBRO en esa banda).
-    * Máx 3 jefes ACTIVOS por banda (simultáneos).
-    * El bot detecta si el mensaje contiene la palabra 'jefe' (case-insensitive).
+    * El usuario debe llevar al menos 15 días seguidos como miembro de esa banda
+    * Máx 3 jefes activos por banda
+    * Solo el dueño puede solicitar nuevos jefes
+
+- Bypass de cooldowns: si el mensaje contiene 'cooldown' o 'cd', se saltan
+  los cooldowns de 4 y 5 días (NO se salta el cooldown de desmantelación
+  ni el límite semanal ni la capacidad).
+
+- Desmantelación: expulsa a todos y aplica cooldown de 7 días que bloquea
+  unirse a CUALQUIER banda.
 """
 
 import os
@@ -21,6 +29,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 import asyncpg
 from dotenv import load_dotenv
@@ -90,7 +99,9 @@ log = logging.getLogger("band-bot")
 intents = discord.Intents.default()
 intents.members = True
 intents.reactions = True
-intents.message_content = True  # Necesario para los comandos de texto (!estado, !banda)
+# message_content NO es necesario para slash commands. Solo se usa para procesar
+# mensajes en los canales de solicitar/quitar (donde el bot lee menciones y palabras clave).
+intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 bot.db_pool: asyncpg.Pool | None = None  # type: ignore[attr-defined]
@@ -103,12 +114,11 @@ CREATE TABLE IF NOT EXISTS band_membership (
     guild_id      BIGINT NOT NULL,
     user_id       BIGINT NOT NULL,
     band_role_id  BIGINT NOT NULL,
-    role_kind     TEXT NOT NULL DEFAULT 'member',  -- 'member' | 'leader'
+    role_kind     TEXT NOT NULL DEFAULT 'member',
     joined_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     left_at       TIMESTAMPTZ
 );
 
--- Migración: añadir columna si no existe (para bases ya creadas)
 ALTER TABLE band_membership
     ADD COLUMN IF NOT EXISTS role_kind TEXT NOT NULL DEFAULT 'member';
 
@@ -124,7 +134,6 @@ CREATE INDEX IF NOT EXISTS idx_membership_band_active
 CREATE INDEX IF NOT EXISTS idx_membership_band_joined
     ON band_membership (guild_id, band_role_id, joined_at);
 
--- Cooldowns por desmantelación (bloquean unirse a cualquier banda)
 CREATE TABLE IF NOT EXISTS disbandment_cooldown (
     id          BIGSERIAL PRIMARY KEY,
     guild_id    BIGINT NOT NULL,
@@ -139,9 +148,7 @@ CREATE INDEX IF NOT EXISTS idx_disbandment_user
 
 
 async def init_db() -> asyncpg.Pool:
-    # Debug: mostrar a qué host se está conectando (sin exponer credenciales)
     if DATABASE_URL:
-        # Extraer solo el host:puerto para ver, sin la contraseña
         try:
             after_at = DATABASE_URL.split("@")[1].split("/")[0]
             log.info(f"Conectando a la base de datos en: {after_at}")
@@ -150,8 +157,6 @@ async def init_db() -> asyncpg.Pool:
     else:
         log.error("¡DATABASE_URL no está definida!")
 
-    # Neon y otros proveedores requieren SSL. asyncpg no acepta ?sslmode=require en la URL,
-    # así que lo quitamos y configuramos SSL aparte.
     db_url = DATABASE_URL
     ssl_required = False
     if db_url and "sslmode=require" in db_url:
@@ -169,7 +174,6 @@ async def init_db() -> asyncpg.Pool:
 
 
 async def get_active_membership(user_id: int, guild_id: int, role_kind: str | None = None):
-    """Devuelve la membresía activa del usuario. Si role_kind se da, filtra."""
     async with bot.db_pool.acquire() as conn:
         if role_kind is None:
             return await conn.fetchrow(
@@ -193,7 +197,6 @@ async def get_active_membership(user_id: int, guild_id: int, role_kind: str | No
 
 
 async def get_last_membership(user_id: int, guild_id: int, band_role_id: int | None = None, role_kind: str = "member"):
-    """Última membresía cerrada (de tipo role_kind)."""
     async with bot.db_pool.acquire() as conn:
         if band_role_id is None:
             return await conn.fetchrow(
@@ -220,10 +223,7 @@ async def get_last_membership(user_id: int, guild_id: int, band_role_id: int | N
 async def open_membership(user_id: int, guild_id: int, band_role_id: int, role_kind: str = "member") -> None:
     async with bot.db_pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO band_membership (guild_id, user_id, band_role_id, role_kind)
-            VALUES ($1, $2, $3, $4)
-            """,
+            "INSERT INTO band_membership (guild_id, user_id, band_role_id, role_kind) VALUES ($1, $2, $3, $4)",
             guild_id, user_id, band_role_id, role_kind,
         )
 
@@ -237,20 +237,15 @@ async def close_membership(membership_id: int) -> None:
 
 
 async def add_disbandment_cooldown(user_id: int, guild_id: int, days: int, reason: str) -> None:
-    """Crea un cooldown por desmantelación que expira en X días."""
     expires_at = datetime.now(timezone.utc) + timedelta(days=days)
     async with bot.db_pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO disbandment_cooldown (guild_id, user_id, expires_at, reason)
-            VALUES ($1, $2, $3, $4)
-            """,
+            "INSERT INTO disbandment_cooldown (guild_id, user_id, expires_at, reason) VALUES ($1, $2, $3, $4)",
             guild_id, user_id, expires_at, reason,
         )
 
 
 async def get_active_disbandment_cooldown(user_id: int, guild_id: int):
-    """Devuelve el cooldown de desmantelación activo (si hay), el más reciente."""
     async with bot.db_pool.acquire() as conn:
         return await conn.fetchrow(
             """
@@ -263,9 +258,7 @@ async def get_active_disbandment_cooldown(user_id: int, guild_id: int):
 
 
 async def count_weekly_member_assignments(guild_id: int, band_role_id: int) -> int:
-    """Cuenta asignaciones de MIEMBRO aprobadas en la banda durante la semana actual (lunes 00:00 UTC en adelante)."""
     now = datetime.now(timezone.utc)
-    # Lunes de esta semana a las 00:00 UTC
     monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
     async with bot.db_pool.acquire() as conn:
         return await conn.fetchval(
@@ -279,7 +272,6 @@ async def count_weekly_member_assignments(guild_id: int, band_role_id: int) -> i
 
 
 async def count_active_leaders(guild_id: int, band_role_id: int) -> int:
-    """Cuenta jefes activos en la banda. band_role_id es el rol de MIEMBRO (la 'banda')."""
     async with bot.db_pool.acquire() as conn:
         return await conn.fetchval(
             """
@@ -292,7 +284,6 @@ async def count_active_leaders(guild_id: int, band_role_id: int) -> int:
 
 
 async def count_active_total_in_band(guild_id: int, band_role_id: int) -> int:
-    """Cuenta personas únicas activas en la banda (cada persona cuenta 1, sea miembro, jefe o ambos)."""
     async with bot.db_pool.acquire() as conn:
         return await conn.fetchval(
             """
@@ -304,10 +295,6 @@ async def count_active_total_in_band(guild_id: int, band_role_id: int) -> int:
 
 
 async def continuous_member_days_in_band(user_id: int, guild_id: int, band_role_id: int) -> float:
-    """
-    Días SEGUIDOS que el usuario lleva como miembro ACTIVO en esta banda.
-    Solo considera la membresía actual (left_at IS NULL). Si no es miembro activo, devuelve 0.
-    """
     async with bot.db_pool.acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -341,7 +328,6 @@ def _format_remaining(delta: timedelta) -> str:
 
 
 def get_band_from_leader(member: discord.Member) -> int | None:
-    """Devuelve el role_id de miembro de la banda según el rol de jefe del autor."""
     member_role_ids = {r.id for r in member.roles}
     matching = member_role_ids & LEADER_TO_MEMBER_ROLE.keys()
     if not matching:
@@ -366,26 +352,18 @@ def get_first_user_mention(message: discord.Message) -> discord.Member | None:
 
 
 def is_leader_request(message: discord.Message) -> bool:
-    """True si el mensaje contiene la palabra 'jefe' como palabra completa (case-insensitive)."""
     return bool(re.search(rf"\b{LEADER_KEYWORD}\b", message.content, re.IGNORECASE))
 
 
 def is_bypass_cooldown(message: discord.Message) -> bool:
-    """True si el mensaje contiene 'cooldown' o 'cd' como palabra completa (case-insensitive)."""
     pattern = r"\b(" + "|".join(BYPASS_COOLDOWN_KEYWORDS) + r")\b"
     return bool(re.search(pattern, message.content, re.IGNORECASE))
 
 
 # ===== Verificaciones =====
 async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: int, bypass_cooldowns: bool = False) -> tuple[bool, str]:
-    """Verifica si se puede asignar rol de MIEMBRO a un usuario.
-
-    Si bypass_cooldowns=True, se saltan los cooldowns de 4 y 5 días
-    (pero se mantienen las demás restricciones: no estar en otra banda y límite semanal).
-    """
     now = datetime.now(timezone.utc)
 
-    # 1. ¿Ya tiene una banda activa?
     active = await get_active_membership(user_id, guild_id, role_kind="member")
     if active:
         if active["band_role_id"] == target_band_role_id:
@@ -395,17 +373,15 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
             "Debe salir de ella primero en el canal de quitar rango."
         )
 
-    # 1.5. Cooldown por desmantelación — NO se salta con bypass
+    # Cooldown por desmantelación — NO se salta con bypass
     disband_cd = await get_active_disbandment_cooldown(user_id, guild_id)
     if disband_cd:
         remaining = disband_cd["expires_at"] - now
         return False, (
             f"❌ el usuario tiene un **cooldown por desmantelación** activo. "
-            f"Faltan **{_format_remaining(remaining)}**. "
-            f"({disband_cd['reason'] or 'sin razón especificada'})"
+            f"Faltan **{_format_remaining(remaining)}**. ({disband_cd['reason'] or 'sin razón'})"
         )
 
-    # 2. Cooldown misma banda (4 días) — se salta si bypass
     if not bypass_cooldowns:
         last_same = await get_last_membership(user_id, guild_id, target_band_role_id, role_kind="member")
         if last_same:
@@ -414,8 +390,6 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
                 remaining = timedelta(days=COOLDOWN_SAME_BAND_DAYS) - elapsed
                 return False, f"❌ cooldown de la **misma banda** activo. Faltan **{_format_remaining(remaining)}**."
 
-    # 3. Cooldown otra banda (5 días) — se salta si bypass
-    if not bypass_cooldowns:
         last_any = await get_last_membership(user_id, guild_id, role_kind="member")
         if last_any and last_any["band_role_id"] != target_band_role_id:
             elapsed = now - last_any["left_at"]
@@ -426,15 +400,13 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
                     f"(<@&{last_any['band_role_id']}>) activo. Faltan **{_format_remaining(remaining)}**."
                 )
 
-    # 4. Límite semanal de la banda (5 nuevos por semana) — NO se salta con bypass
     weekly_count = await count_weekly_member_assignments(guild_id, target_band_role_id)
     if weekly_count >= WEEKLY_MEMBER_LIMIT:
         return False, (
             f"❌ esta banda ya alcanzó el límite de **{WEEKLY_MEMBER_LIMIT} nuevos miembros esta semana** "
-            f"({weekly_count}/{WEEKLY_MEMBER_LIMIT}). El contador se reinicia el lunes 00:00 UTC."
+            f"({weekly_count}/{WEEKLY_MEMBER_LIMIT}). Se reinicia el lunes 00:00 UTC."
         )
 
-    # 5. Capacidad máxima de la banda (miembros + jefes) — NO se salta con bypass
     capacity = BAND_CAPACITY.get(target_band_role_id)
     if capacity is not None:
         active_total = await count_active_total_in_band(guild_id, target_band_role_id)
@@ -448,8 +420,6 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
 
 
 async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: int) -> tuple[bool, str]:
-    """Verifica si se puede asignar rol de JEFE."""
-    # 1. ¿Ya es jefe activo de alguna banda?
     active_leader = await get_active_membership(user_id, guild_id, role_kind="leader")
     if active_leader:
         if active_leader["band_role_id"] == target_band_role_id:
@@ -459,7 +429,6 @@ async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: 
             "Debe dejar el cargo primero."
         )
 
-    # 2. Debe llevar al menos 15 días SEGUIDOS como miembro activo de esta banda
     days_as_member = await continuous_member_days_in_band(user_id, guild_id, target_band_role_id)
     if days_as_member <= 0:
         return False, (
@@ -471,10 +440,9 @@ async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: 
         return False, (
             f"❌ el usuario lleva solo **{days_as_member:.1f} días seguidos** como miembro de esta banda. "
             f"Necesita **{MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos** mínimo "
-            f"(faltan ~{days_remaining:.1f} días). Si sale de la banda, el contador se reinicia."
+            f"(faltan ~{days_remaining:.1f} días). Si sale, el contador se reinicia."
         )
 
-    # 3. Máximo 3 jefes activos en la banda
     leader_count = await count_active_leaders(guild_id, target_band_role_id)
     if leader_count >= MAX_LEADERS_PER_BAND:
         return False, (
@@ -488,7 +456,6 @@ async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: 
 # ===== Eventos =====
 @bot.event
 async def on_ready():
-    # Construir los mapeos derivados desde BANDS_CONFIG
     global LEADER_TO_MEMBER_ROLE, MEMBER_TO_LEADER_ROLE, BAND_CAPACITY, BAND_OWNER
     LEADER_TO_MEMBER_ROLE = {b["leader_role"]: b["member_role"] for b in BANDS_CONFIG}
     MEMBER_TO_LEADER_ROLE = {b["member_role"]: b["leader_role"] for b in BANDS_CONFIG}
@@ -501,6 +468,16 @@ async def on_ready():
     for b in BANDS_CONFIG:
         owner = b.get("owner_id", "sin dueño")
         log.info(f"  - {b['name']}: capacidad {b['capacity']}, dueño: {owner}")
+
+    # Sincronizar slash commands con el guild (instantáneo, no global)
+    if GUILD_ID:
+        guild = discord.Object(id=GUILD_ID)
+        bot.tree.copy_global_to(guild=guild)
+        synced = await bot.tree.sync(guild=guild)
+        log.info(f"✅ Sincronizados {len(synced)} slash commands en el guild {GUILD_ID}")
+    else:
+        synced = await bot.tree.sync()
+        log.info(f"✅ Sincronizados {len(synced)} slash commands globalmente (puede tardar hasta 1h)")
 
 
 @bot.event
@@ -552,7 +529,6 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         )
         return
 
-    # ¿Es solicitud de jefe o de miembro?
     leader_request = is_leader_request(message)
     bypass = is_bypass_cooldown(message)
 
@@ -568,7 +544,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             await handle_remove_member(channel, target, band_role, reactor, leader)
 
 
-# ===== Handlers de asignación =====
+# ===== Handlers de asignación/remoción (por reacción) =====
 async def handle_assign_member(channel, member, band_role, reactor, leader, bypass: bool = False):
     can_join, msg = await check_member_assign(member.id, channel.guild.id, band_role.id, bypass_cooldowns=bypass)
     if not can_join:
@@ -596,12 +572,9 @@ async def handle_assign_member(channel, member, band_role, reactor, leader, bypa
 
 
 async def handle_assign_leader(channel, member, band_role, reactor, leader):
-    # Solo el dueño de la banda puede solicitar nuevos jefes
     owner_id = BAND_OWNER.get(band_role.id)
     if owner_id is None:
-        await channel.send(
-            f"⚠️ {band_role.mention} no tiene dueño configurado. No se pueden solicitar jefes."
-        )
+        await channel.send(f"⚠️ {band_role.mention} no tiene dueño configurado.")
         return
     if leader.id != owner_id:
         await channel.send(
@@ -614,14 +587,13 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
         await channel.send(f"⛔ {member.mention}: {msg}")
         return
 
-    # Buscar el rol de jefe correspondiente a esta banda
     leader_role_id = MEMBER_TO_LEADER_ROLE.get(band_role.id)
     if leader_role_id is None:
         await channel.send(f"⚠️ No hay rol de jefe configurado para {band_role.mention}.")
         return
     leader_role = channel.guild.get_role(leader_role_id)
     if leader_role is None:
-        await channel.send(f"⚠️ Rol de jefe (ID {leader_role_id}) no encontrado en el servidor.")
+        await channel.send(f"⚠️ Rol de jefe (ID {leader_role_id}) no encontrado.")
         return
 
     try:
@@ -630,7 +602,6 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
         await channel.send("⚠️ No tengo permisos para asignar el rol de jefe.")
         return
 
-    # Registramos como 'leader' usando el ID del rol de MIEMBRO como referencia de la banda
     await open_membership(member.id, channel.guild.id, band_role.id, role_kind="leader")
     leader_count = await count_active_leaders(channel.guild.id, band_role.id)
     await channel.send(
@@ -640,14 +611,10 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
     )
 
 
-# ===== Handlers de remoción =====
 async def handle_remove_member(channel, member, band_role, reactor, leader):
-    # El dueño no puede ser removido como miembro
     owner_id = BAND_OWNER.get(band_role.id)
     if owner_id and member.id == owner_id:
-        await channel.send(
-            f"⛔ No se le puede quitar el rango al **dueño** de la banda ({member.mention})."
-        )
+        await channel.send(f"⛔ No se le puede quitar el rango al **dueño** de la banda ({member.mention}).")
         return
 
     active = await get_active_membership(member.id, channel.guild.id, role_kind="member")
@@ -670,12 +637,9 @@ async def handle_remove_member(channel, member, band_role, reactor, leader):
 
 
 async def handle_remove_leader(channel, member, band_role, reactor, leader):
-    # Solo el dueño puede quitar jefes
     owner_id = BAND_OWNER.get(band_role.id)
     if owner_id is None:
-        await channel.send(
-            f"⚠️ {band_role.mention} no tiene dueño configurado. No se pueden quitar jefes."
-        )
+        await channel.send(f"⚠️ {band_role.mention} no tiene dueño configurado.")
         return
     if leader.id != owner_id:
         await channel.send(
@@ -683,11 +647,8 @@ async def handle_remove_leader(channel, member, band_role, reactor, leader):
         )
         return
 
-    # El dueño no puede ser removido (ni por sí mismo)
     if member.id == owner_id:
-        await channel.send(
-            f"⛔ No se le puede quitar el rango al **dueño** de la banda ({member.mention})."
-        )
+        await channel.send(f"⛔ No se le puede quitar el rango al **dueño** ({member.mention}).")
         return
 
     active = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
@@ -711,13 +672,15 @@ async def handle_remove_leader(channel, member, band_role, reactor, leader):
     )
 
 
-# ===== Comando estado =====
-@bot.command(name="estado")
-async def estado_cmd(ctx, member: discord.Member | None = None):
-    member = member or ctx.author
-    active_member = await get_active_membership(member.id, ctx.guild.id, role_kind="member")
-    active_leader = await get_active_membership(member.id, ctx.guild.id, role_kind="leader")
-    last = await get_last_membership(member.id, ctx.guild.id, role_kind="member")
+# ===== SLASH COMMANDS =====
+
+@bot.tree.command(name="estado", description="Muestra el estado y cooldowns de un usuario")
+@app_commands.describe(usuario="El usuario a consultar (por defecto, tú mismo)")
+async def estado_slash(interaction: discord.Interaction, usuario: discord.Member | None = None):
+    member = usuario or interaction.user
+    active_member = await get_active_membership(member.id, interaction.guild.id, role_kind="member")
+    active_leader = await get_active_membership(member.id, interaction.guild.id, role_kind="leader")
+    last = await get_last_membership(member.id, interaction.guild.id, role_kind="member")
 
     lines = [f"**Estado de {member.display_name}:**"]
     if active_member:
@@ -740,8 +703,7 @@ async def estado_cmd(ctx, member: discord.Member | None = None):
         if same_remaining.total_seconds() <= 0 and other_remaining.total_seconds() <= 0:
             lines.append("• Sin cooldowns activos.")
 
-    # Cooldown por desmantelación
-    disband_cd = await get_active_disbandment_cooldown(member.id, ctx.guild.id)
+    disband_cd = await get_active_disbandment_cooldown(member.id, interaction.guild.id)
     if disband_cd:
         remaining = disband_cd["expires_at"] - datetime.now(timezone.utc)
         lines.append(
@@ -749,24 +711,23 @@ async def estado_cmd(ctx, member: discord.Member | None = None):
             f"({disband_cd['reason']})"
         )
 
-    await ctx.send("\n".join(lines))
+    await interaction.response.send_message("\n".join(lines))
 
 
-# ===== Comando: ver estado de la banda =====
-@bot.command(name="banda")
-async def banda_cmd(ctx, role: discord.Role):
-    """Muestra cupo semanal, jefes activos, capacidad y dueño de una banda."""
-    if role.id not in MEMBER_TO_LEADER_ROLE:
-        await ctx.send(f"⚠️ {role.mention} no es una banda configurada.")
+@bot.tree.command(name="banda", description="Muestra cupo, jefes y dueño de una banda")
+@app_commands.describe(banda="La banda a consultar")
+async def banda_slash(interaction: discord.Interaction, banda: discord.Role):
+    if banda.id not in MEMBER_TO_LEADER_ROLE:
+        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
         return
-    weekly = await count_weekly_member_assignments(ctx.guild.id, role.id)
-    leaders = await count_active_leaders(ctx.guild.id, role.id)
-    total = await count_active_total_in_band(ctx.guild.id, role.id)
-    capacity = BAND_CAPACITY.get(role.id, "?")
-    owner_id = BAND_OWNER.get(role.id)
+    weekly = await count_weekly_member_assignments(interaction.guild.id, banda.id)
+    leaders = await count_active_leaders(interaction.guild.id, banda.id)
+    total = await count_active_total_in_band(interaction.guild.id, banda.id)
+    capacity = BAND_CAPACITY.get(banda.id, "?")
+    owner_id = BAND_OWNER.get(banda.id)
     owner_line = f"• Dueño: <@{owner_id}>\n" if owner_id else "• Dueño: *no configurado*\n"
-    await ctx.send(
-        f"**{role.name}**\n"
+    await interaction.response.send_message(
+        f"**{banda.name}**\n"
         f"{owner_line}"
         f"• Personas activas: {total}/{capacity}\n"
         f"• Jefes activos: {leaders}/{MAX_LEADERS_PER_BAND}\n"
@@ -774,179 +735,178 @@ async def banda_cmd(ctx, role: discord.Role):
     )
 
 
-# ===== Comandos de registro manual (solo staff) =====
-def _staff_only():
-    """Decorador para comandos que solo puede usar staff/admin."""
-    async def predicate(ctx):
-        if is_staff(ctx.author):
-            return True
-        await ctx.send("⛔ Solo admins/staff pueden usar este comando.")
-        return False
-    return commands.check(predicate)
-
-
-@bot.command(name="registrar_miembro")
-@_staff_only()
-async def registrar_miembro_cmd(ctx, member: discord.Member, banda: discord.Role, dias_atras: int = 0):
-    """Registra manualmente a un miembro existente en la BD.
-    Uso: !registrar_miembro @user @RolBanda [dias_atras]
-    Ejemplo: !registrar_miembro @Juan @LosLobos 20  (lo registra como si llevara 20 días)
-    """
+@bot.tree.command(name="registrar_miembro", description="[Staff] Registra manualmente a un miembro existente")
+@app_commands.describe(
+    usuario="El usuario a registrar",
+    banda="La banda donde registrarlo",
+    dias_atras="Hace cuántos días entró (0 = hoy)",
+)
+async def registrar_miembro_slash(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    banda: discord.Role,
+    dias_atras: int = 0,
+):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Solo admins/staff pueden usar este comando.", ephemeral=True)
+        return
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await ctx.send(f"⚠️ {banda.mention} no es una banda configurada.")
+        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
         return
 
-    # Verificar que no haya ya una membresía activa de tipo 'member'
-    active = await get_active_membership(member.id, ctx.guild.id, role_kind="member")
+    active = await get_active_membership(usuario.id, interaction.guild.id, role_kind="member")
     if active and active["band_role_id"] == banda.id:
-        await ctx.send(f"⚠️ {member.mention} ya está registrado como miembro de {banda.mention}.")
+        await interaction.response.send_message(f"⚠️ {usuario.mention} ya está registrado como miembro de {banda.mention}.", ephemeral=True)
         return
     if active:
-        await ctx.send(
-            f"⚠️ {member.mention} ya está registrado en otra banda (<@&{active['band_role_id']}>). "
-            "Debe salir de ella primero."
+        await interaction.response.send_message(
+            f"⚠️ {usuario.mention} ya está en otra banda (<@&{active['band_role_id']}>).",
+            ephemeral=True,
         )
         return
 
-    # Insertar con la fecha calculada
     joined_at = datetime.now(timezone.utc) - timedelta(days=dias_atras)
     async with bot.db_pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO band_membership (guild_id, user_id, band_role_id, role_kind, joined_at)
-            VALUES ($1, $2, $3, 'member', $4)
-            """,
-            ctx.guild.id, member.id, banda.id, joined_at,
+            "INSERT INTO band_membership (guild_id, user_id, band_role_id, role_kind, joined_at) VALUES ($1, $2, $3, 'member', $4)",
+            interaction.guild.id, usuario.id, banda.id, joined_at,
         )
 
-    # Asignar el rol si no lo tiene ya
-    if banda not in member.roles:
+    if banda not in usuario.roles:
         try:
-            await member.add_roles(banda, reason=f"Registrado manualmente por {ctx.author}")
+            await usuario.add_roles(banda, reason=f"Registrado manualmente por {interaction.user}")
         except discord.Forbidden:
-            await ctx.send("⚠️ Registrado en BD, pero no tengo permisos para asignar el rol.")
+            await interaction.response.send_message("⚠️ Registrado en BD pero no tengo permisos para asignar el rol.", ephemeral=True)
             return
 
-    await ctx.send(
-        f"✅ {member.mention} registrado como miembro de {banda.mention} "
-        f"(fecha de entrada: hace {dias_atras} días)."
+    await interaction.response.send_message(
+        f"✅ {usuario.mention} registrado como miembro de {banda.mention} (entrada: hace {dias_atras} días)."
     )
 
 
-@bot.command(name="registrar_jefe")
-@_staff_only()
-async def registrar_jefe_cmd(ctx, member: discord.Member, banda: discord.Role, dias_atras: int = 0):
-    """Registra manualmente a un jefe existente en la BD.
-    Uso: !registrar_jefe @user @RolBanda [dias_atras]
-    Útil para registrar al dueño inicial u otros jefes que ya tenían el rol antes del bot.
-    """
+@bot.tree.command(name="registrar_jefe", description="[Staff] Registra manualmente a un jefe existente")
+@app_commands.describe(
+    usuario="El usuario a registrar como jefe",
+    banda="La banda donde registrarlo",
+    dias_atras="Hace cuántos días es jefe (0 = hoy)",
+)
+async def registrar_jefe_slash(
+    interaction: discord.Interaction,
+    usuario: discord.Member,
+    banda: discord.Role,
+    dias_atras: int = 0,
+):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Solo admins/staff pueden usar este comando.", ephemeral=True)
+        return
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await ctx.send(f"⚠️ {banda.mention} no es una banda configurada.")
+        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
         return
 
-    # Verificar que no haya ya una membresía activa de tipo 'leader'
-    active = await get_active_membership(member.id, ctx.guild.id, role_kind="leader")
+    active = await get_active_membership(usuario.id, interaction.guild.id, role_kind="leader")
     if active and active["band_role_id"] == banda.id:
-        await ctx.send(f"⚠️ {member.mention} ya está registrado como jefe de {banda.mention}.")
+        await interaction.response.send_message(f"⚠️ {usuario.mention} ya es jefe de {banda.mention}.", ephemeral=True)
         return
     if active:
-        await ctx.send(
-            f"⚠️ {member.mention} ya es jefe de otra banda (<@&{active['band_role_id']}>)."
+        await interaction.response.send_message(
+            f"⚠️ {usuario.mention} ya es jefe de otra banda (<@&{active['band_role_id']}>).",
+            ephemeral=True,
         )
         return
 
     joined_at = datetime.now(timezone.utc) - timedelta(days=dias_atras)
     async with bot.db_pool.acquire() as conn:
         await conn.execute(
-            """
-            INSERT INTO band_membership (guild_id, user_id, band_role_id, role_kind, joined_at)
-            VALUES ($1, $2, $3, 'leader', $4)
-            """,
-            ctx.guild.id, member.id, banda.id, joined_at,
+            "INSERT INTO band_membership (guild_id, user_id, band_role_id, role_kind, joined_at) VALUES ($1, $2, $3, 'leader', $4)",
+            interaction.guild.id, usuario.id, banda.id, joined_at,
         )
 
-    # Asignar el rol de jefe si no lo tiene
     leader_role_id = MEMBER_TO_LEADER_ROLE.get(banda.id)
-    leader_role = ctx.guild.get_role(leader_role_id) if leader_role_id else None
-    if leader_role and leader_role not in member.roles:
+    leader_role = interaction.guild.get_role(leader_role_id) if leader_role_id else None
+    if leader_role and leader_role not in usuario.roles:
         try:
-            await member.add_roles(leader_role, reason=f"Registrado manualmente por {ctx.author}")
+            await usuario.add_roles(leader_role, reason=f"Registrado manualmente por {interaction.user}")
         except discord.Forbidden:
-            await ctx.send("⚠️ Registrado en BD, pero no tengo permisos para asignar el rol de jefe.")
+            await interaction.response.send_message("⚠️ Registrado en BD pero no tengo permisos para asignar el rol.", ephemeral=True)
             return
 
-    await ctx.send(
-        f"👑 {member.mention} registrado como jefe de {banda.mention} "
-        f"(fecha de entrada: hace {dias_atras} días)."
+    await interaction.response.send_message(
+        f"👑 {usuario.mention} registrado como jefe de {banda.mention} (entrada: hace {dias_atras} días)."
     )
 
 
-@bot.command(name="desmantelacion", aliases=["desmantelar"])
-@_staff_only()
-async def desmantelacion_cmd(ctx, banda: discord.Role):
-    """Desmantela una banda: expulsa a todos (miembros, jefes y dueño) y aplica cooldown de 7 días.
-    Uso: !desmantelacion @RolBanda
-    """
+@bot.tree.command(name="desmantelacion", description="[Staff] Desmantela una banda y aplica cooldown de 7 días a todos")
+@app_commands.describe(banda="La banda a desmantelar")
+async def desmantelacion_slash(interaction: discord.Interaction, banda: discord.Role):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message("⛔ Solo admins/staff pueden usar este comando.", ephemeral=True)
+        return
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await ctx.send(f"⚠️ {banda.mention} no es una banda configurada.")
+        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
         return
 
-    # Confirmación previa
-    confirm_msg = await ctx.send(
+    # Confirmación con un botón
+    class ConfirmView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=30)
+            self.confirmed = False
+
+        @discord.ui.button(label="Confirmar desmantelación", style=discord.ButtonStyle.danger, emoji="💥")
+        async def confirm(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            if btn_interaction.user.id != interaction.user.id:
+                await btn_interaction.response.send_message("Solo quien ejecutó el comando puede confirmar.", ephemeral=True)
+                return
+            self.confirmed = True
+            self.stop()
+            await btn_interaction.response.defer()
+
+        @discord.ui.button(label="Cancelar", style=discord.ButtonStyle.secondary)
+        async def cancel(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            if btn_interaction.user.id != interaction.user.id:
+                await btn_interaction.response.send_message("Solo quien ejecutó el comando puede cancelar.", ephemeral=True)
+                return
+            self.stop()
+            await btn_interaction.response.defer()
+
+    view = ConfirmView()
+    await interaction.response.send_message(
         f"⚠️ **CONFIRMACIÓN REQUERIDA**\n"
-        f"Vas a desmantelar **{banda.name}**. Esto:\n"
+        f"Vas a desmantelar **{banda.name}**:\n"
         f"• Expulsa a TODOS los miembros y jefes (incluido el dueño)\n"
-        f"• Les aplica un cooldown de **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a CUALQUIER banda\n"
+        f"• Cooldown de **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a CUALQUIER banda\n"
         f"• Esta acción NO se puede deshacer\n\n"
-        f"Reacciona con ✅ en los próximos 30 segundos para confirmar."
+        f"Tienes 30 segundos para confirmar.",
+        view=view,
     )
-    await confirm_msg.add_reaction("✅")
 
-    def check(reaction, user):
-        return (
-            user.id == ctx.author.id
-            and reaction.message.id == confirm_msg.id
-            and str(reaction.emoji) == "✅"
-        )
-
-    try:
-        await bot.wait_for("reaction_add", timeout=30.0, check=check)
-    except asyncio.TimeoutError:
-        await ctx.send("❌ Desmantelación cancelada (sin confirmación).")
+    await view.wait()
+    if not view.confirmed:
+        await interaction.followup.send("❌ Desmantelación cancelada.")
         return
 
-    # Obtener TODAS las membresías activas (miembros + jefes) de esta banda
     async with bot.db_pool.acquire() as conn:
         rows = await conn.fetch(
-            """
-            SELECT id, user_id, role_kind FROM band_membership
-            WHERE guild_id = $1 AND band_role_id = $2 AND left_at IS NULL
-            """,
-            ctx.guild.id, banda.id,
+            "SELECT id, user_id, role_kind FROM band_membership WHERE guild_id = $1 AND band_role_id = $2 AND left_at IS NULL",
+            interaction.guild.id, banda.id,
         )
 
     if not rows:
-        await ctx.send(f"⚠️ {banda.mention} no tiene miembros ni jefes activos para expulsar.")
+        await interaction.followup.send(f"⚠️ {banda.mention} no tiene miembros ni jefes activos.")
         return
 
-    # Reunir IDs únicos de personas afectadas (alguien puede aparecer 2 veces si es miembro Y jefe)
     affected_user_ids = {row["user_id"] for row in rows}
-
     leader_role_id = MEMBER_TO_LEADER_ROLE.get(banda.id)
-    leader_role = ctx.guild.get_role(leader_role_id) if leader_role_id else None
-
+    leader_role = interaction.guild.get_role(leader_role_id) if leader_role_id else None
     expelled_count = 0
     role_errors = 0
-    reason_str = f"Desmantelación de {banda.name} por {ctx.author}"
+    reason_str = f"Desmantelación de {banda.name} por {interaction.user}"
 
     for user_id in affected_user_ids:
-        # Cerrar TODAS las membresías activas (miembro y jefe) de esta banda para este usuario
         for row in rows:
             if row["user_id"] == user_id:
                 await close_membership(row["id"])
 
-        # Quitar roles en Discord
-        member = ctx.guild.get_member(user_id)
+        member = interaction.guild.get_member(user_id)
         if member is not None:
             roles_to_remove = []
             if banda in member.roles:
@@ -959,9 +919,8 @@ async def desmantelacion_cmd(ctx, banda: discord.Role):
                 except discord.Forbidden:
                     role_errors += 1
 
-        # Aplicar cooldown de desmantelación
         await add_disbandment_cooldown(
-            user_id, ctx.guild.id, DISBANDMENT_COOLDOWN_DAYS,
+            user_id, interaction.guild.id, DISBANDMENT_COOLDOWN_DAYS,
             reason=f"Desmantelación de {banda.name}",
         )
         expelled_count += 1
@@ -970,11 +929,11 @@ async def desmantelacion_cmd(ctx, banda: discord.Role):
         f"💥 **{banda.name} ha sido desmantelada.**\n"
         f"• Personas expulsadas: **{expelled_count}**\n"
         f"• Cooldown aplicado: **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a cualquier banda\n"
-        f"• Ejecutado por: {ctx.author.mention}"
+        f"• Ejecutado por: {interaction.user.mention}"
     )
     if role_errors:
         msg += f"\n⚠️ No pude quitar el rol a {role_errors} usuarios (problema de permisos)."
-    await ctx.send(msg)
+    await interaction.followup.send(msg)
 
 
 # ===== Main =====
@@ -985,5 +944,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    import asyncio
     asyncio.run(main())
