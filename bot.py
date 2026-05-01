@@ -62,18 +62,109 @@ BYPASS_COOLDOWN_KEYWORDS = {"cooldown", "cd"}  # Palabras que saltan ambos coold
 #   - owner_id:      ID del usuario dueño de la banda (puede solicitar/quitar jefes; nadie puede quitarle el rango)
 BANDS_CONFIG: list[dict] = [    
      {
-        "name":        "GFS",
-        "leader_role": 895419164091646002,
-         "member_role": 1499222197628043364,
-         "capacity":    15,
-         "owner_id":    768192318083432518,
+        "name":        "Poison Crew",
+        "leader_role": 1194817495211720724,
+        "member_role": 1183559269476479038,
+        "capacity":    15,
+        "owner_id":    1041454182344949771,
  },
      {
-         "name":        "Karo gang",
-         "leader_role": 1499230616590356622,
-         "member_role": 1499230847314690199,
+         "name":        "Sin Ley",
+         "leader_role": 1202433355229040741,
+         "member_role": 1202433274425778228,
+         "capacity":    15,
+         "owner_id":    1317252417645052009,
+     },
+     {
+         "name":        "K9",
+         "leader_role": 1209199793730232360,
+         "member_role": 1209199543904894986,
          "capacity":    12,
-         "owner_id":    768192318083432518,
+         "owner_id":    1199435499824226534,
+     },
+     {
+         "name":        "La-Sub21",
+         "leader_role": 1211157133341757450,
+         "member_role": 1211157225146421289,
+         "capacity":    15,
+         "owner_id":    728800359518306314,
+     },
+     {
+         "name":        "Faze",
+         "leader_role": 1213885972148658226,
+         "member_role": 1213885841223712818,
+         "capacity":    12,
+         "owner_id":    702329561622249535,
+     },
+     {
+         "name":        "Pinky Blinders",
+         "leader_role": 1232570043175534602,
+         "member_role": 1232570426790641684,
+         "capacity":    15,
+         "owner_id":    430830587641856021,
+     },
+     {
+         "name":        "Faze",
+         "leader_role": 1213885972148658226,
+         "member_role": 1213885841223712818,
+         "capacity":    12,
+         "owner_id":    702329561622249535,
+     },
+     {
+         "name":        "Esex Gang",
+         "leader_role": 1256718554422706246,
+         "member_role": 1256718594067140648,
+         "capacity":    15,
+         "owner_id":    753750899158941726,
+     },
+     {
+         "name":        "Barrio Chino",
+         "leader_role": 1266240280580063256,
+         "member_role": 1266240330764910622,
+         "capacity":    15,
+         "owner_id":    1213250777598918842,
+     },
+     {
+         "name":        "Enigma Crew",
+         "leader_role": 1281111966827679836,
+         "member_role": 1281112212160774235,
+         "capacity":    12,
+         "owner_id":    1275573986314686575,
+     },
+     {
+         "name":        "The Monkeys",
+         "leader_role": 1283249693412954126,
+         "member_role": 1283249702959058956,
+         "capacity":    15,
+         "owner_id":    1304140223076368435,
+     },
+     {
+         "name":        "Underblood",
+         "leader_role": 1283255788139184188,
+         "member_role": 1283255795122831410,
+         "capacity":    15,
+         "owner_id":    1006279091563008092,
+     },
+     {
+         "name":        "C´est La Mort",
+         "leader_role": 1355029136783179786,
+         "member_role": 1355028215000858624,
+         "capacity":    15,
+         "owner_id":    1345387913260568637,
+     },
+     {
+         "name":        "Legends Never Die",
+         "leader_role": 1407916113685381262,
+         "member_role": 1407916043132993567,
+         "capacity":    12,
+         "owner_id":    700171212654903396,
+     },
+     {
+         "name":        "SPT",
+         "leader_role": 1276961557124747398,
+         "member_role": 1276961456642064384,
+         "capacity":    12,
+         "owner_id":    1155673440808865843,
      },
 ]
 
@@ -85,7 +176,7 @@ BAND_OWNER: dict[int, int] = {}     # member_role_id -> owner user_id
 
 # IDs de roles que pueden confirmar (admin/staff)
 STAFF_ROLE_IDS: set[int] = {
-    794004890837712987
+    1318979211205021837
 }
 
 # ===== Logging =====
