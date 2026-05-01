@@ -440,13 +440,18 @@ def is_staff(member: discord.Member) -> bool:
     return bool({r.id for r in member.roles} & STAFF_ROLE_IDS)
 
 
-def get_first_user_mention(message: discord.Message) -> discord.Member | None:
+def get_all_user_mentions(message: discord.Message) -> list[discord.Member]:
+    """Devuelve TODOS los usuarios mencionados (no bots), preservando el orden y sin duplicados."""
+    seen = set()
+    members = []
     for user in message.mentions:
-        if not user.bot:
-            member = message.guild.get_member(user.id)
-            if member:
-                return member
-    return None
+        if user.bot or user.id in seen:
+            continue
+        member = message.guild.get_member(user.id)
+        if member:
+            seen.add(user.id)
+            members.append(member)
+    return members
 
 
 def is_leader_request(message: discord.Message) -> bool:
@@ -620,8 +625,8 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         await channel.send(f"⚠️ Rol de banda no encontrado (ID {band_member_role_id}).")
         return
 
-    target = get_first_user_mention(message)
-    if target is None:
+    targets = get_all_user_mentions(message)
+    if not targets:
         await channel.send(
             f"⚠️ {reactor.mention} No se encontró ninguna mención de usuario en el mensaje."
         )
@@ -630,16 +635,18 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     leader_request = is_leader_request(message)
     bypass = is_bypass_cooldown(message)
 
-    if payload.channel_id == REQUEST_CHANNEL_ID:
-        if leader_request:
-            await handle_assign_leader(channel, target, band_role, reactor, leader)
+    # Procesar cada mención por separado
+    for target in targets:
+        if payload.channel_id == REQUEST_CHANNEL_ID:
+            if leader_request:
+                await handle_assign_leader(channel, target, band_role, reactor, leader)
+            else:
+                await handle_assign_member(channel, target, band_role, reactor, leader, bypass=bypass)
         else:
-            await handle_assign_member(channel, target, band_role, reactor, leader, bypass=bypass)
-    else:
-        if leader_request:
-            await handle_remove_leader(channel, target, band_role, reactor, leader)
-        else:
-            await handle_remove_member(channel, target, band_role, reactor, leader)
+            if leader_request:
+                await handle_remove_leader(channel, target, band_role, reactor, leader)
+            else:
+                await handle_remove_member(channel, target, band_role, reactor, leader)
 
 
 # ===== Handlers de asignación/remoción (por reacción) =====
