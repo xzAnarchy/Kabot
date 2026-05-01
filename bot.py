@@ -16,6 +16,7 @@ REGLAS:
 
 import os
 import re
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -36,6 +37,7 @@ REMOVE_CHANNEL_ID = int(os.getenv("REMOVE_CHANNEL_ID", "0"))
 
 COOLDOWN_OTHER_BAND_DAYS = 5
 COOLDOWN_SAME_BAND_DAYS = 4
+DISBANDMENT_COOLDOWN_DAYS = 7
 WEEKLY_MEMBER_LIMIT = 5
 MAX_LEADERS_PER_BAND = 3
 MIN_DAYS_AS_MEMBER_FOR_LEADER = 15
@@ -121,10 +123,33 @@ CREATE INDEX IF NOT EXISTS idx_membership_band_active
 
 CREATE INDEX IF NOT EXISTS idx_membership_band_joined
     ON band_membership (guild_id, band_role_id, joined_at);
+
+-- Cooldowns por desmantelación (bloquean unirse a cualquier banda)
+CREATE TABLE IF NOT EXISTS disbandment_cooldown (
+    id          BIGSERIAL PRIMARY KEY,
+    guild_id    BIGINT NOT NULL,
+    user_id     BIGINT NOT NULL,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    reason      TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_disbandment_user
+    ON disbandment_cooldown (guild_id, user_id, expires_at DESC);
 """
 
 
 async def init_db() -> asyncpg.Pool:
+    # Debug: mostrar a qué host se está conectando (sin exponer credenciales)
+    if DATABASE_URL:
+        # Extraer solo el host:puerto para ver, sin la contraseña
+        try:
+            after_at = DATABASE_URL.split("@")[1].split("/")[0]
+            log.info(f"Conectando a la base de datos en: {after_at}")
+        except Exception:
+            log.info("DATABASE_URL configurada pero formato no estándar.")
+    else:
+        log.error("¡DATABASE_URL no está definida!")
+
     # Neon y otros proveedores requieren SSL. asyncpg no acepta ?sslmode=require en la URL,
     # así que lo quitamos y configuramos SSL aparte.
     db_url = DATABASE_URL
@@ -208,6 +233,32 @@ async def close_membership(membership_id: int) -> None:
         await conn.execute(
             "UPDATE band_membership SET left_at = NOW() WHERE id = $1",
             membership_id,
+        )
+
+
+async def add_disbandment_cooldown(user_id: int, guild_id: int, days: int, reason: str) -> None:
+    """Crea un cooldown por desmantelación que expira en X días."""
+    expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+    async with bot.db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO disbandment_cooldown (guild_id, user_id, expires_at, reason)
+            VALUES ($1, $2, $3, $4)
+            """,
+            guild_id, user_id, expires_at, reason,
+        )
+
+
+async def get_active_disbandment_cooldown(user_id: int, guild_id: int):
+    """Devuelve el cooldown de desmantelación activo (si hay), el más reciente."""
+    async with bot.db_pool.acquire() as conn:
+        return await conn.fetchrow(
+            """
+            SELECT expires_at, reason FROM disbandment_cooldown
+            WHERE guild_id = $1 AND user_id = $2 AND expires_at > NOW()
+            ORDER BY expires_at DESC LIMIT 1
+            """,
+            guild_id, user_id,
         )
 
 
@@ -342,6 +393,16 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
         return False, (
             f"el usuario ya pertenece a otra banda (<@&{active['band_role_id']}>). "
             "Debe salir de ella primero en el canal de quitar rango."
+        )
+
+    # 1.5. Cooldown por desmantelación — NO se salta con bypass
+    disband_cd = await get_active_disbandment_cooldown(user_id, guild_id)
+    if disband_cd:
+        remaining = disband_cd["expires_at"] - now
+        return False, (
+            f"❌ el usuario tiene un **cooldown por desmantelación** activo. "
+            f"Faltan **{_format_remaining(remaining)}**. "
+            f"({disband_cd['reason'] or 'sin razón especificada'})"
         )
 
     # 2. Cooldown misma banda (4 días) — se salta si bypass
@@ -679,6 +740,15 @@ async def estado_cmd(ctx, member: discord.Member | None = None):
         if same_remaining.total_seconds() <= 0 and other_remaining.total_seconds() <= 0:
             lines.append("• Sin cooldowns activos.")
 
+    # Cooldown por desmantelación
+    disband_cd = await get_active_disbandment_cooldown(member.id, ctx.guild.id)
+    if disband_cd:
+        remaining = disband_cd["expires_at"] - datetime.now(timezone.utc)
+        lines.append(
+            f"• 💥 **Cooldown por desmantelación**: {_format_remaining(remaining)} restantes "
+            f"({disband_cd['reason']})"
+        )
+
     await ctx.send("\n".join(lines))
 
 
@@ -809,6 +879,102 @@ async def registrar_jefe_cmd(ctx, member: discord.Member, banda: discord.Role, d
         f"👑 {member.mention} registrado como jefe de {banda.mention} "
         f"(fecha de entrada: hace {dias_atras} días)."
     )
+
+
+@bot.command(name="desmantelacion", aliases=["desmantelar"])
+@_staff_only()
+async def desmantelacion_cmd(ctx, banda: discord.Role):
+    """Desmantela una banda: expulsa a todos (miembros, jefes y dueño) y aplica cooldown de 7 días.
+    Uso: !desmantelacion @RolBanda
+    """
+    if banda.id not in MEMBER_TO_LEADER_ROLE:
+        await ctx.send(f"⚠️ {banda.mention} no es una banda configurada.")
+        return
+
+    # Confirmación previa
+    confirm_msg = await ctx.send(
+        f"⚠️ **CONFIRMACIÓN REQUERIDA**\n"
+        f"Vas a desmantelar **{banda.name}**. Esto:\n"
+        f"• Expulsa a TODOS los miembros y jefes (incluido el dueño)\n"
+        f"• Les aplica un cooldown de **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a CUALQUIER banda\n"
+        f"• Esta acción NO se puede deshacer\n\n"
+        f"Reacciona con ✅ en los próximos 30 segundos para confirmar."
+    )
+    await confirm_msg.add_reaction("✅")
+
+    def check(reaction, user):
+        return (
+            user.id == ctx.author.id
+            and reaction.message.id == confirm_msg.id
+            and str(reaction.emoji) == "✅"
+        )
+
+    try:
+        await bot.wait_for("reaction_add", timeout=30.0, check=check)
+    except asyncio.TimeoutError:
+        await ctx.send("❌ Desmantelación cancelada (sin confirmación).")
+        return
+
+    # Obtener TODAS las membresías activas (miembros + jefes) de esta banda
+    async with bot.db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, user_id, role_kind FROM band_membership
+            WHERE guild_id = $1 AND band_role_id = $2 AND left_at IS NULL
+            """,
+            ctx.guild.id, banda.id,
+        )
+
+    if not rows:
+        await ctx.send(f"⚠️ {banda.mention} no tiene miembros ni jefes activos para expulsar.")
+        return
+
+    # Reunir IDs únicos de personas afectadas (alguien puede aparecer 2 veces si es miembro Y jefe)
+    affected_user_ids = {row["user_id"] for row in rows}
+
+    leader_role_id = MEMBER_TO_LEADER_ROLE.get(banda.id)
+    leader_role = ctx.guild.get_role(leader_role_id) if leader_role_id else None
+
+    expelled_count = 0
+    role_errors = 0
+    reason_str = f"Desmantelación de {banda.name} por {ctx.author}"
+
+    for user_id in affected_user_ids:
+        # Cerrar TODAS las membresías activas (miembro y jefe) de esta banda para este usuario
+        for row in rows:
+            if row["user_id"] == user_id:
+                await close_membership(row["id"])
+
+        # Quitar roles en Discord
+        member = ctx.guild.get_member(user_id)
+        if member is not None:
+            roles_to_remove = []
+            if banda in member.roles:
+                roles_to_remove.append(banda)
+            if leader_role and leader_role in member.roles:
+                roles_to_remove.append(leader_role)
+            if roles_to_remove:
+                try:
+                    await member.remove_roles(*roles_to_remove, reason=reason_str)
+                except discord.Forbidden:
+                    role_errors += 1
+
+        # Aplicar cooldown de desmantelación
+        await add_disbandment_cooldown(
+            user_id, ctx.guild.id, DISBANDMENT_COOLDOWN_DAYS,
+            reason=f"Desmantelación de {banda.name}",
+        )
+        expelled_count += 1
+
+    msg = (
+        f"💥 **{banda.name} ha sido desmantelada.**\n"
+        f"• Personas expulsadas: **{expelled_count}**\n"
+        f"• Cooldown aplicado: **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a cualquier banda\n"
+        f"• Ejecutado por: {ctx.author.mention}"
+    )
+    if role_errors:
+        msg += f"\n⚠️ No pude quitar el rol a {role_errors} usuarios (problema de permisos)."
+    await ctx.send(msg)
 
 
 # ===== Main =====
