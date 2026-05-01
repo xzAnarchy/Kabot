@@ -166,6 +166,13 @@ BANDS_CONFIG: list[dict] = [
          "capacity":    12,
          "owner_id":    1155673440808865843,
      },
+     {
+         "name":        "TDZ",
+         "leader_role": 1349210777499865109,
+         "member_role": 1349210967984050237,
+         "capacity":    15,
+         "owner_id":    605235307910135808,
+     },
 ]
 
 # Mapeos derivados (se calculan al inicio, no editar a mano)
