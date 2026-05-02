@@ -705,10 +705,18 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
         await channel.send(f"⚠️ Rol de jefe (ID {leader_role_id}) no encontrado.")
         return
 
+    # Cerrar la membresía de tipo 'member' (si existe) — los jefes no son miembros
+    active_member = await get_active_membership(member.id, channel.guild.id, role_kind="member")
+    if active_member and active_member["band_role_id"] == band_role.id:
+        await close_membership(active_member["id"])
+
+    # Quitar el rol de miembro y agregar el de jefe en Discord
     try:
+        if band_role in member.roles:
+            await member.remove_roles(band_role, reason=f"Ascendido a jefe por {leader}")
         await member.add_roles(leader_role, reason=f"Jefe asignado por {reactor} (solicitó: {leader})")
     except discord.Forbidden:
-        await channel.send("⚠️ No tengo permisos para asignar el rol de jefe.")
+        await channel.send("⚠️ No tengo permisos para gestionar los roles.")
         return
 
     await open_membership(member.id, channel.guild.id, band_role.id, role_kind="leader")
@@ -721,11 +729,10 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
 
 
 async def handle_remove_auto(channel, member, band_role, reactor, leader):
-    """Quita el rol automáticamente: detecta si la persona es jefe, miembro o ambos.
+    """Quita el rol automáticamente: detecta si la persona es jefe o miembro de esta banda.
 
-    - Si es solo miembro -> quita miembro.
-    - Si es solo jefe -> quita jefe (requiere ser dueño).
-    - Si es ambos -> quita jefe primero (requiere ser dueño), luego miembro.
+    Como los roles son excluyentes (un jefe no es miembro al mismo tiempo),
+    delegamos al handler correspondiente.
     """
     active_member = await get_active_membership(member.id, channel.guild.id, role_kind="member")
     active_leader = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
@@ -733,21 +740,13 @@ async def handle_remove_auto(channel, member, band_role, reactor, leader):
     is_member_here = active_member and active_member["band_role_id"] == band_role.id
     is_leader_here = active_leader and active_leader["band_role_id"] == band_role.id
 
-    if not is_member_here and not is_leader_here:
-        await channel.send(f"⚠️ {member.mention} no está activamente en {band_role.mention}.")
-        return
-
-    # Si es jefe en esta banda, primero quitar el jefazgo (requiere ser dueño)
     if is_leader_here:
+        # Si es jefe, quitarle el rango de jefe (lo degrada a miembro automáticamente)
         await handle_remove_leader(channel, member, band_role, reactor, leader)
-        # Si después de intentar quitar jefe, sigue siendo jefe activo, algo falló (probablemente no es el dueño)
-        still_leader = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
-        if still_leader and still_leader["band_role_id"] == band_role.id:
-            return  # No continuar, ya se notificó el error
-
-    # Si también es miembro, quitar miembro
-    if is_member_here:
+    elif is_member_here:
         await handle_remove_member(channel, member, band_role, reactor, leader)
+    else:
+        await channel.send(f"⚠️ {member.mention} no está activamente en {band_role.mention}.")
 
 
 async def handle_remove_member(channel, member, band_role, reactor, leader):
@@ -797,16 +796,25 @@ async def handle_remove_leader(channel, member, band_role, reactor, leader):
 
     leader_role_id = MEMBER_TO_LEADER_ROLE.get(band_role.id)
     leader_role = channel.guild.get_role(leader_role_id) if leader_role_id else None
-    if leader_role and leader_role in member.roles:
-        try:
-            await member.remove_roles(leader_role, reason=f"Jefe removido por {reactor} (solicitó: {leader})")
-        except discord.Forbidden:
-            await channel.send("⚠️ No tengo permisos para remover el rol de jefe.")
-            return
 
+    # Degradar: quitar rol de jefe y poner rol de miembro
+    try:
+        if leader_role and leader_role in member.roles:
+            await member.remove_roles(leader_role, reason=f"Degradado por {reactor} (solicitó: {leader})")
+        if band_role not in member.roles:
+            await member.add_roles(band_role, reason=f"Degradado a miembro por {leader}")
+    except discord.Forbidden:
+        await channel.send("⚠️ No tengo permisos para gestionar los roles.")
+        return
+
+    # Cerrar la membresía 'leader'
     await close_membership(active["id"])
+
+    # Abrir nueva membresía 'member' (degradación, no es asignación nueva)
+    await open_membership(member.id, channel.guild.id, band_role.id, role_kind="member")
+
     await channel.send(
-        f"👋 {member.mention} ya no es jefe de {band_role.mention}.\n"
+        f"👋 {member.mention} ya no es jefe de {band_role.mention}, ha sido degradado a **miembro**.\n"
         f"Solicitado por: {leader.mention} · Confirmado por: {reactor.mention}"
     )
 
@@ -1084,4 +1092,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
