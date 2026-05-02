@@ -51,7 +51,7 @@ WEEKLY_MEMBER_LIMIT = 5
 MAX_LEADERS_PER_BAND = 3
 MIN_DAYS_AS_MEMBER_FOR_LEADER = 15
 
-REACTION_CONFIRM = "✅"
+REACTION_CONFIRM = "⬇️"
 LEADER_KEYWORD = "jefe"  # Palabra clave para detectar solicitud de jefe
 BYPASS_COOLDOWN_KEYWORDS = {"cooldown", "cd"}  # Palabras que saltan ambos cooldowns
 
