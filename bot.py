@@ -567,15 +567,16 @@ async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: 
     if days_as_member <= 0:
         return False, [
             "No puede ser ascendido a Jefe",
-            f"Motivo: No es integrante activo de esta banda. Necesita completar {MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos en la OD",
-            "Estado actual: 0 días como integrante",
+            f"Motivo: Necesita completar {MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos en la OD",
+            f"Estado actual: Tiene 0 días - Faltan {MIN_DAYS_AS_MEMBER_FOR_LEADER} días",
         ]
     if days_as_member < MIN_DAYS_AS_MEMBER_FOR_LEADER:
-        days_remaining = MIN_DAYS_AS_MEMBER_FOR_LEADER - days_as_member
+        days_have = int(days_as_member)
+        days_remaining = MIN_DAYS_AS_MEMBER_FOR_LEADER - days_have
         return False, [
             "No puede ser ascendido a Jefe",
             f"Motivo: Necesita completar {MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos en la OD",
-            f"Estado actual: {days_as_member:.1f} días - Faltan ~{days_remaining:.1f} días",
+            f"Estado actual: Tiene {days_have} días - Faltan {days_remaining} días",
         ]
 
     leader_count = await count_active_leaders(guild_id, target_band_role_id)
