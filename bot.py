@@ -638,15 +638,19 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     # Procesar cada mención por separado
     for target in targets:
         if payload.channel_id == REQUEST_CHANNEL_ID:
+            # Asignar: la palabra 'jefe' decide si se asigna jefe o miembro
             if leader_request:
                 await handle_assign_leader(channel, target, band_role, reactor, leader)
             else:
                 await handle_assign_member(channel, target, band_role, reactor, leader, bypass=bypass)
         else:
+            # Quitar:
+            #   - Si dice 'jefe' -> solo quita el rol de jefe (mantiene miembro)
+            #   - Si NO dice 'jefe' -> detecta automáticamente qué tiene y lo quita
             if leader_request:
                 await handle_remove_leader(channel, target, band_role, reactor, leader)
             else:
-                await handle_remove_member(channel, target, band_role, reactor, leader)
+                await handle_remove_auto(channel, target, band_role, reactor, leader)
 
 
 # ===== Handlers de asignación/remoción (por reacción) =====
@@ -714,6 +718,36 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
         f"Solicitado por: {leader.mention} · Confirmado por: {reactor.mention} · "
         f"Jefes activos: {leader_count}/{MAX_LEADERS_PER_BAND}"
     )
+
+
+async def handle_remove_auto(channel, member, band_role, reactor, leader):
+    """Quita el rol automáticamente: detecta si la persona es jefe, miembro o ambos.
+
+    - Si es solo miembro -> quita miembro.
+    - Si es solo jefe -> quita jefe (requiere ser dueño).
+    - Si es ambos -> quita jefe primero (requiere ser dueño), luego miembro.
+    """
+    active_member = await get_active_membership(member.id, channel.guild.id, role_kind="member")
+    active_leader = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
+
+    is_member_here = active_member and active_member["band_role_id"] == band_role.id
+    is_leader_here = active_leader and active_leader["band_role_id"] == band_role.id
+
+    if not is_member_here and not is_leader_here:
+        await channel.send(f"⚠️ {member.mention} no está activamente en {band_role.mention}.")
+        return
+
+    # Si es jefe en esta banda, primero quitar el jefazgo (requiere ser dueño)
+    if is_leader_here:
+        await handle_remove_leader(channel, member, band_role, reactor, leader)
+        # Si después de intentar quitar jefe, sigue siendo jefe activo, algo falló (probablemente no es el dueño)
+        still_leader = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
+        if still_leader and still_leader["band_role_id"] == band_role.id:
+            return  # No continuar, ya se notificó el error
+
+    # Si también es miembro, quitar miembro
+    if is_member_here:
+        await handle_remove_member(channel, member, band_role, reactor, leader)
 
 
 async def handle_remove_member(channel, member, band_role, reactor, leader):
@@ -1050,3 +1084,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+    
