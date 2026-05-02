@@ -410,6 +410,17 @@ async def continuous_member_days_in_band(user_id: int, guild_id: int, band_role_
 
 
 # ===== Utilidades =====
+SEPARATOR = "-" * 49
+
+
+def format_message(*lines: str) -> str:
+    """Formatea un mensaje uniforme: todas las líneas con viñeta + separador final."""
+    if not lines:
+        return SEPARATOR
+    formatted = [f"- {line}" for line in lines]
+    return "\n".join(formatted) + "\n" + SEPARATOR
+
+
 def _format_remaining(delta: timedelta) -> str:
     total_seconds = int(delta.total_seconds())
     days, rem = divmod(total_seconds, 86400)
@@ -464,26 +475,33 @@ def is_bypass_cooldown(message: discord.Message) -> bool:
 
 
 # ===== Verificaciones =====
-async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: int, bypass_cooldowns: bool = False) -> tuple[bool, str]:
+async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: int, bypass_cooldowns: bool = False) -> tuple[bool, list[str]]:
+    """Verifica si se puede asignar miembro. Devuelve (puede, [linea_titulo, motivo, estado_actual])."""
     now = datetime.now(timezone.utc)
 
     active = await get_active_membership(user_id, guild_id, role_kind="member")
     if active:
         if active["band_role_id"] == target_band_role_id:
-            return False, "el usuario ya pertenece a esta banda."
-        return False, (
-            f"el usuario ya pertenece a otra banda (<@&{active['band_role_id']}>). "
-            "Debe salir de ella primero en el canal de quitar rango."
-        )
+            return False, [
+                "No puedes ingresar a esta OD",
+                "Motivo: Ya pertenece a esta banda",
+                f"Estado actual: Activo en <@&{active['band_role_id']}>",
+            ]
+        return False, [
+            "No puedes ingresar a esta OD",
+            f"Motivo: Ya pertenece a otra banda. Debe salir primero",
+            f"Estado actual: Activo en <@&{active['band_role_id']}>",
+        ]
 
     # Cooldown por desmantelación — NO se salta con bypass
     disband_cd = await get_active_disbandment_cooldown(user_id, guild_id)
     if disband_cd:
         remaining = disband_cd["expires_at"] - now
-        return False, (
-            f"❌ el usuario tiene un **cooldown por desmantelación** activo. "
-            f"Faltan **{_format_remaining(remaining)}**. ({disband_cd['reason'] or 'sin razón'})"
-        )
+        return False, [
+            "No puedes ingresar a esta OD",
+            f"Motivo: Cooldown por desmantelación activo ({disband_cd['reason'] or 'sin razón'})",
+            f"Estado actual: Faltan {_format_remaining(remaining)}",
+        ]
 
     if not bypass_cooldowns:
         last_same = await get_last_membership(user_id, guild_id, target_band_role_id, role_kind="member")
@@ -491,69 +509,84 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
             elapsed = now - last_same["left_at"]
             if elapsed < timedelta(days=COOLDOWN_SAME_BAND_DAYS):
                 remaining = timedelta(days=COOLDOWN_SAME_BAND_DAYS) - elapsed
-                return False, f"❌ cooldown de la **misma banda** activo. Faltan **{_format_remaining(remaining)}**."
+                return False, [
+                    "Aún no puedes ingresar a la misma OD",
+                    "Motivo: Cooldown activo",
+                    f"Estado actual: Faltan {_format_remaining(remaining)}",
+                ]
 
         last_any = await get_last_membership(user_id, guild_id, role_kind="member")
         if last_any and last_any["band_role_id"] != target_band_role_id:
             elapsed = now - last_any["left_at"]
             if elapsed < timedelta(days=COOLDOWN_OTHER_BAND_DAYS):
                 remaining = timedelta(days=COOLDOWN_OTHER_BAND_DAYS) - elapsed
-                return False, (
-                    f"❌ cooldown por haber estado en **otra banda** "
-                    f"(<@&{last_any['band_role_id']}>) activo. Faltan **{_format_remaining(remaining)}**."
-                )
+                return False, [
+                    "No puedes ingresar a esta OD",
+                    "Motivo: Cooldown activo",
+                    f"Estado actual: Faltan {_format_remaining(remaining)}",
+                ]
 
     weekly_count = await count_weekly_member_assignments(guild_id, target_band_role_id)
     if weekly_count >= WEEKLY_MEMBER_LIMIT:
-        return False, (
-            f"❌ esta banda ya alcanzó el límite de **{WEEKLY_MEMBER_LIMIT} nuevos miembros esta semana** "
-            f"({weekly_count}/{WEEKLY_MEMBER_LIMIT}). Se reinicia el lunes 00:00 UTC."
-        )
+        return False, [
+            "No puedes ingresar a esta OD",
+            "Motivo: Ya alcanzaron el limite de rotación de integrantes por semana",
+            f"Estado actual: {weekly_count}/{WEEKLY_MEMBER_LIMIT} - Se reinicia el lunes 00:00 UTC",
+        ]
 
     capacity = BAND_CAPACITY.get(target_band_role_id)
     if capacity is not None:
         active_total = await count_active_total_in_band(guild_id, target_band_role_id)
         if active_total >= capacity:
-            return False, (
-                f"❌ esta banda está **llena** ({active_total}/{capacity} personas, "
-                f"incluyendo jefes). Debe salir alguien primero."
-            )
+            return False, [
+                "No puedes ingresar a esta OD",
+                "Motivo: Esta banda está llena, debe ser expulsado alguien primero",
+                f"Estado actual: {active_total}/{capacity} integrantes",
+            ]
 
-    return True, ""
+    return True, []
 
 
-async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: int) -> tuple[bool, str]:
+async def check_leader_assign(user_id: int, guild_id: int, target_band_role_id: int) -> tuple[bool, list[str]]:
+    """Verifica si se puede asignar jefe. Devuelve (puede, [linea_titulo, motivo, estado_actual])."""
     active_leader = await get_active_membership(user_id, guild_id, role_kind="leader")
     if active_leader:
         if active_leader["band_role_id"] == target_band_role_id:
-            return False, "el usuario ya es jefe de esta banda."
-        return False, (
-            f"el usuario ya es jefe de otra banda (<@&{active_leader['band_role_id']}>). "
-            "Debe dejar el cargo primero."
-        )
+            return False, [
+                "No puede ser ascendido a Jefe",
+                "Motivo: Ya es Jefe de esta banda",
+                f"Estado actual: Activo en <@&{active_leader['band_role_id']}>",
+            ]
+        return False, [
+            "No puede ser ascendido a Jefe",
+            "Motivo: Ya es Jefe de otra banda. Debe dejar el cargo primero",
+            f"Estado actual: Activo como Jefe en <@&{active_leader['band_role_id']}>",
+        ]
 
     days_as_member = await continuous_member_days_in_band(user_id, guild_id, target_band_role_id)
     if days_as_member <= 0:
-        return False, (
-            f"❌ el usuario no es miembro activo de esta banda. "
-            f"Debe llevar al menos **{MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos** como miembro."
-        )
+        return False, [
+            "No puede ser ascendido a Jefe",
+            f"Motivo: No es integrante activo de esta banda. Necesita completar {MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos en la OD",
+            "Estado actual: 0 días como integrante",
+        ]
     if days_as_member < MIN_DAYS_AS_MEMBER_FOR_LEADER:
         days_remaining = MIN_DAYS_AS_MEMBER_FOR_LEADER - days_as_member
-        return False, (
-            f"❌ el usuario lleva solo **{days_as_member:.1f} días seguidos** como miembro de esta banda. "
-            f"Necesita **{MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos** mínimo "
-            f"(faltan ~{days_remaining:.1f} días). Si sale, el contador se reinicia."
-        )
+        return False, [
+            "No puede ser ascendido a Jefe",
+            f"Motivo: Necesita completar {MIN_DAYS_AS_MEMBER_FOR_LEADER} días seguidos en la OD",
+            f"Estado actual: {days_as_member:.1f} días - Faltan ~{days_remaining:.1f} días",
+        ]
 
     leader_count = await count_active_leaders(guild_id, target_band_role_id)
     if leader_count >= MAX_LEADERS_PER_BAND:
-        return False, (
-            f"❌ esta banda ya tiene el máximo de **{MAX_LEADERS_PER_BAND} jefes** activos "
-            f"({leader_count}/{MAX_LEADERS_PER_BAND}). Debe salir uno primero."
-        )
+        return False, [
+            "No puede ser ascendido a Jefe",
+            f"Motivo: Esta banda ya tiene el máximo de {MAX_LEADERS_PER_BAND} Jefes activos",
+            f"Estado actual: Jefes activos {leader_count}/{MAX_LEADERS_PER_BAND}",
+        ]
 
-    return True, ""
+    return True, []
 
 
 # ===== Eventos =====
@@ -615,21 +648,21 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
     band_member_role_id = get_band_from_leader(leader)
     if band_member_role_id is None:
-        await channel.send(
-            f"⚠️ {reactor.mention} El autor del mensaje no tiene rol de jefe de ninguna banda configurada."
-        )
+        await channel.send(format_message(
+            f"{reactor.mention} El autor del mensaje no tiene rol de **Jefe** de ninguna banda configurada"
+        ))
         return
 
     band_role = guild.get_role(band_member_role_id)
     if band_role is None:
-        await channel.send(f"⚠️ Rol de banda no encontrado (ID {band_member_role_id}).")
+        await channel.send(format_message(f"Rol de banda no encontrado (ID {band_member_role_id})"))
         return
 
     targets = get_all_user_mentions(message)
     if not targets:
-        await channel.send(
-            f"⚠️ {reactor.mention} No se encontró ninguna mención de usuario en el mensaje."
-        )
+        await channel.send(format_message(
+            f"{reactor.mention} No se encontró ninguna mención de usuario en el mensaje"
+        ))
         return
 
     leader_request = is_leader_request(message)
@@ -655,9 +688,13 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
 # ===== Handlers de asignación/remoción (por reacción) =====
 async def handle_assign_member(channel, member, band_role, reactor, leader, bypass: bool = False):
-    can_join, msg = await check_member_assign(member.id, channel.guild.id, band_role.id, bypass_cooldowns=bypass)
+    can_join, error_lines = await check_member_assign(member.id, channel.guild.id, band_role.id, bypass_cooldowns=bypass)
     if not can_join:
-        await channel.send(f"⛔ {member.mention}: {msg}")
+        # error_lines[0] es el título, el resto son viñetas
+        await channel.send(format_message(
+            f"{member.mention} {error_lines[0]}",
+            *error_lines[1:],
+        ))
         return
 
     reason = f"Miembro asignado por {reactor} (jefe: {leader})"
@@ -667,42 +704,46 @@ async def handle_assign_member(channel, member, band_role, reactor, leader, bypa
     try:
         await member.add_roles(band_role, reason=reason)
     except discord.Forbidden:
-        await channel.send("⚠️ No tengo permisos para asignar ese rol.")
+        await channel.send(format_message("No tengo permisos para asignar ese rol"))
         return
 
     await open_membership(member.id, channel.guild.id, band_role.id, role_kind="member")
     weekly = await count_weekly_member_assignments(channel.guild.id, band_role.id)
-    bypass_note = " ⚡ *Cooldowns saltados*" if bypass else ""
-    await channel.send(
-        f"✅ {member.mention} se ha unido a {band_role.mention} como **miembro**.{bypass_note}\n"
-        f"Solicitado por: {leader.mention} · Confirmado por: {reactor.mention} · "
-        f"Cupo semanal: {weekly}/{WEEKLY_MEMBER_LIMIT}"
-    )
+    bypass_note = " (Cooldowns saltados)" if bypass else ""
+    await channel.send(format_message(
+        f"{member.mention} Ahora es el nuevo integrante de {band_role.mention}{bypass_note}",
+        f"Solicitado por {leader.mention}",
+        f"Confirmado por {reactor.mention}",
+        f"Estado actual: Cupo Semanal {weekly}/{WEEKLY_MEMBER_LIMIT}",
+    ))
 
 
 async def handle_assign_leader(channel, member, band_role, reactor, leader):
     owner_id = BAND_OWNER.get(band_role.id)
     if owner_id is None:
-        await channel.send(f"⚠️ {band_role.mention} no tiene dueño configurado.")
+        await channel.send(format_message(f"{band_role.mention} no tiene **dueño** configurado"))
         return
     if leader.id != owner_id:
-        await channel.send(
-            f"⛔ Solo el **dueño** de {band_role.mention} (<@{owner_id}>) puede solicitar nuevos jefes."
-        )
+        await channel.send(format_message(
+            f"Solo el **dueño** de {band_role.mention} (<@{owner_id}>) puede solicitar nuevos Jefes"
+        ))
         return
 
-    can_join, msg = await check_leader_assign(member.id, channel.guild.id, band_role.id)
+    can_join, error_lines = await check_leader_assign(member.id, channel.guild.id, band_role.id)
     if not can_join:
-        await channel.send(f"⛔ {member.mention}: {msg}")
+        await channel.send(format_message(
+            f"{member.mention} {error_lines[0]}",
+            *error_lines[1:],
+        ))
         return
 
     leader_role_id = MEMBER_TO_LEADER_ROLE.get(band_role.id)
     if leader_role_id is None:
-        await channel.send(f"⚠️ No hay rol de jefe configurado para {band_role.mention}.")
+        await channel.send(format_message(f"No hay rol de **Jefe** configurado para {band_role.mention}"))
         return
     leader_role = channel.guild.get_role(leader_role_id)
     if leader_role is None:
-        await channel.send(f"⚠️ Rol de jefe (ID {leader_role_id}) no encontrado.")
+        await channel.send(format_message(f"Rol de **Jefe** (ID {leader_role_id}) no encontrado"))
         return
 
     # Cerrar la membresía de tipo 'member' (si existe) — los jefes no son miembros
@@ -716,16 +757,17 @@ async def handle_assign_leader(channel, member, band_role, reactor, leader):
             await member.remove_roles(band_role, reason=f"Ascendido a jefe por {leader}")
         await member.add_roles(leader_role, reason=f"Jefe asignado por {reactor} (solicitó: {leader})")
     except discord.Forbidden:
-        await channel.send("⚠️ No tengo permisos para gestionar los roles.")
+        await channel.send(format_message("No tengo permisos para gestionar los roles"))
         return
 
     await open_membership(member.id, channel.guild.id, band_role.id, role_kind="leader")
     leader_count = await count_active_leaders(channel.guild.id, band_role.id)
-    await channel.send(
-        f"👑 {member.mention} ha sido ascendido a **jefe** de {band_role.mention}.\n"
-        f"Solicitado por: {leader.mention} · Confirmado por: {reactor.mention} · "
-        f"Jefes activos: {leader_count}/{MAX_LEADERS_PER_BAND}"
-    )
+    await channel.send(format_message(
+        f"{member.mention} Ha sido ascendido a Jefe de {band_role.mention}",
+        f"Solicitado por {leader.mention}",
+        f"Confirmado por {reactor.mention}",
+        f"Estado actual: Jefes activos {leader_count}/{MAX_LEADERS_PER_BAND}",
+    ))
 
 
 async def handle_remove_auto(channel, member, band_role, reactor, leader):
@@ -746,52 +788,54 @@ async def handle_remove_auto(channel, member, band_role, reactor, leader):
     elif is_member_here:
         await handle_remove_member(channel, member, band_role, reactor, leader)
     else:
-        await channel.send(f"⚠️ {member.mention} no está activamente en {band_role.mention}.")
+        await channel.send(format_message(f"{member.mention} no está activamente en {band_role.mention}"))
 
 
 async def handle_remove_member(channel, member, band_role, reactor, leader):
     owner_id = BAND_OWNER.get(band_role.id)
     if owner_id and member.id == owner_id:
-        await channel.send(f"⛔ No se le puede quitar el rango al **dueño** de la banda ({member.mention}).")
+        await channel.send(format_message(f"No se le puede quitar el rango al **dueño** de la banda ({member.mention})"))
         return
 
     active = await get_active_membership(member.id, channel.guild.id, role_kind="member")
     if not active or active["band_role_id"] != band_role.id:
-        await channel.send(f"⚠️ {member.mention} no está activamente como miembro en {band_role.mention}.")
+        await channel.send(format_message(f"{member.mention} no está activamente como **miembro** en {band_role.mention}"))
         return
 
     if band_role in member.roles:
         try:
             await member.remove_roles(band_role, reason=f"Removido por {reactor} (jefe: {leader})")
         except discord.Forbidden:
-            await channel.send("⚠️ No tengo permisos para remover ese rol.")
+            await channel.send(format_message("No tengo permisos para remover ese rol"))
             return
 
     await close_membership(active["id"])
-    await channel.send(
-        f"👋 {member.mention} ha salido de {band_role.mention}. El cooldown empieza ahora.\n"
-        f"Solicitado por: {leader.mention} · Confirmado por: {reactor.mention}"
-    )
+    await channel.send(format_message(
+        f"{member.mention} Ha salido de {band_role.mention}",
+        f"Solicitado por {leader.mention}",
+        f"Confirmado por {reactor.mention}",
+        "Estado actual: Se activó el cooldown",
+    ))
 
 
 async def handle_remove_leader(channel, member, band_role, reactor, leader):
     owner_id = BAND_OWNER.get(band_role.id)
     if owner_id is None:
-        await channel.send(f"⚠️ {band_role.mention} no tiene dueño configurado.")
+        await channel.send(format_message(f"{band_role.mention} no tiene **dueño** configurado"))
         return
     if leader.id != owner_id:
-        await channel.send(
-            f"⛔ Solo el **dueño** de {band_role.mention} (<@{owner_id}>) puede quitar el rango de jefe."
-        )
+        await channel.send(format_message(
+            f"Solo el **dueño** de {band_role.mention} (<@{owner_id}>) puede quitar el rango de **Jefe**"
+        ))
         return
 
     if member.id == owner_id:
-        await channel.send(f"⛔ No se le puede quitar el rango al **dueño** ({member.mention}).")
+        await channel.send(format_message(f"No se le puede quitar el rango al **dueño** ({member.mention})"))
         return
 
     active = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
     if not active or active["band_role_id"] != band_role.id:
-        await channel.send(f"⚠️ {member.mention} no es jefe activo de {band_role.mention}.")
+        await channel.send(format_message(f"{member.mention} no es **Jefe** activo de {band_role.mention}"))
         return
 
     leader_role_id = MEMBER_TO_LEADER_ROLE.get(band_role.id)
@@ -804,7 +848,7 @@ async def handle_remove_leader(channel, member, band_role, reactor, leader):
         if band_role not in member.roles:
             await member.add_roles(band_role, reason=f"Degradado a miembro por {leader}")
     except discord.Forbidden:
-        await channel.send("⚠️ No tengo permisos para gestionar los roles.")
+        await channel.send(format_message("No tengo permisos para gestionar los roles"))
         return
 
     # Cerrar la membresía 'leader'
@@ -813,10 +857,13 @@ async def handle_remove_leader(channel, member, band_role, reactor, leader):
     # Abrir nueva membresía 'member' (degradación, no es asignación nueva)
     await open_membership(member.id, channel.guild.id, band_role.id, role_kind="member")
 
-    await channel.send(
-        f"👋 {member.mention} ya no es jefe de {band_role.mention}, ha sido degradado a **miembro**.\n"
-        f"Solicitado por: {leader.mention} · Confirmado por: {reactor.mention}"
-    )
+    leader_count = await count_active_leaders(channel.guild.id, band_role.id)
+    await channel.send(format_message(
+        f"{member.mention} Ya no es Jefe de {band_role.mention}, ha sido degradado a integrante",
+        f"Solicitado por {leader.mention}",
+        f"Confirmado por {reactor.mention}",
+        f"Estado actual: Jefes activos {leader_count}/{MAX_LEADERS_PER_BAND}",
+    ))
 
 
 # ===== SLASH COMMANDS =====
@@ -831,55 +878,55 @@ async def estado_slash(interaction: discord.Interaction, usuario: discord.Member
 
     lines = [f"**Estado de {member.display_name}:**"]
     if active_member:
-        lines.append(f"• Miembro de: <@&{active_member['band_role_id']}> (desde {active_member['joined_at']:%Y-%m-%d %H:%M} UTC)")
+        lines.append(f"Miembro de: <@&{active_member['band_role_id']}> (desde {active_member['joined_at']:%Y-%m-%d %H:%M} UTC)")
     if active_leader:
-        lines.append(f"• Jefe de: <@&{active_leader['band_role_id']}> (desde {active_leader['joined_at']:%Y-%m-%d %H:%M} UTC)")
+        lines.append(f"Jefe de: <@&{active_leader['band_role_id']}> (desde {active_leader['joined_at']:%Y-%m-%d %H:%M} UTC)")
     if not active_member and not active_leader:
-        lines.append("• Sin banda actual.")
+        lines.append("Sin banda actual")
 
     if last:
         now = datetime.now(timezone.utc)
         elapsed = now - last["left_at"]
         same_remaining = timedelta(days=COOLDOWN_SAME_BAND_DAYS) - elapsed
         other_remaining = timedelta(days=COOLDOWN_OTHER_BAND_DAYS) - elapsed
-        lines.append(f"• Última banda: <@&{last['band_role_id']}> (salió {last['left_at']:%Y-%m-%d %H:%M} UTC)")
+        lines.append(f"Última banda: <@&{last['band_role_id']}> (salió {last['left_at']:%Y-%m-%d %H:%M} UTC)")
         if same_remaining.total_seconds() > 0:
-            lines.append(f"• Cooldown misma banda: {_format_remaining(same_remaining)} restantes")
+            lines.append(f"Cooldown misma banda: {_format_remaining(same_remaining)} restantes")
         if other_remaining.total_seconds() > 0:
-            lines.append(f"• Cooldown otra banda: {_format_remaining(other_remaining)} restantes")
+            lines.append(f"Cooldown otra banda: {_format_remaining(other_remaining)} restantes")
         if same_remaining.total_seconds() <= 0 and other_remaining.total_seconds() <= 0:
-            lines.append("• Sin cooldowns activos.")
+            lines.append("Sin cooldowns activos")
 
     disband_cd = await get_active_disbandment_cooldown(member.id, interaction.guild.id)
     if disband_cd:
         remaining = disband_cd["expires_at"] - datetime.now(timezone.utc)
         lines.append(
-            f"• 💥 **Cooldown por desmantelación**: {_format_remaining(remaining)} restantes "
+            f"**Cooldown por desmantelación**: {_format_remaining(remaining)} restantes "
             f"({disband_cd['reason']})"
         )
 
-    await interaction.response.send_message("\n".join(lines))
+    await interaction.response.send_message(format_message(*lines))
 
 
 @bot.tree.command(name="banda", description="Muestra cupo, jefes y dueño de una banda")
 @app_commands.describe(banda="La banda a consultar")
 async def banda_slash(interaction: discord.Interaction, banda: discord.Role):
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
+        await interaction.response.send_message(format_message(f"{banda.mention} no es una banda configurada"), ephemeral=True)
         return
     weekly = await count_weekly_member_assignments(interaction.guild.id, banda.id)
     leaders = await count_active_leaders(interaction.guild.id, banda.id)
     total = await count_active_total_in_band(interaction.guild.id, banda.id)
     capacity = BAND_CAPACITY.get(banda.id, "?")
     owner_id = BAND_OWNER.get(banda.id)
-    owner_line = f"• Dueño: <@{owner_id}>\n" if owner_id else "• Dueño: *no configurado*\n"
-    await interaction.response.send_message(
-        f"**{banda.name}**\n"
-        f"{owner_line}"
-        f"• Personas activas: {total}/{capacity}\n"
-        f"• Jefes activos: {leaders}/{MAX_LEADERS_PER_BAND}\n"
-        f"• Nuevos miembros esta semana: {weekly}/{WEEKLY_MEMBER_LIMIT}"
-    )
+    owner_line = f"**Dueño**: <@{owner_id}>" if owner_id else "**Dueño**: no configurado"
+    await interaction.response.send_message(format_message(
+        f"**{banda.name}**",
+        owner_line,
+        f"Personas activas: {total}/{capacity}",
+        f"Jefes activos: {leaders}/{MAX_LEADERS_PER_BAND}",
+        f"Nuevos miembros esta semana: {weekly}/{WEEKLY_MEMBER_LIMIT}",
+    ))
 
 
 @bot.tree.command(name="registrar_miembro", description="[Staff] Registra manualmente a un miembro existente")
@@ -895,21 +942,20 @@ async def registrar_miembro_slash(
     dias_atras: int = 0,
 ):
     if not is_staff(interaction.user):
-        await interaction.response.send_message("⛔ Solo admins/staff pueden usar este comando.", ephemeral=True)
+        await interaction.response.send_message(format_message("Solo admins/staff pueden usar este comando"), ephemeral=True)
         return
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
+        await interaction.response.send_message(format_message(f"{banda.mention} no es una banda configurada"), ephemeral=True)
         return
 
     active = await get_active_membership(usuario.id, interaction.guild.id, role_kind="member")
     if active and active["band_role_id"] == banda.id:
-        await interaction.response.send_message(f"⚠️ {usuario.mention} ya está registrado como miembro de {banda.mention}.", ephemeral=True)
+        await interaction.response.send_message(format_message(f"{usuario.mention} ya está registrado como **miembro** de {banda.mention}"), ephemeral=True)
         return
     if active:
-        await interaction.response.send_message(
-            f"⚠️ {usuario.mention} ya está en otra banda (<@&{active['band_role_id']}>).",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(format_message(
+            f"{usuario.mention} ya está en otra banda (<@&{active['band_role_id']}>)"
+        ), ephemeral=True)
         return
 
     joined_at = datetime.now(timezone.utc) - timedelta(days=dias_atras)
@@ -923,12 +969,14 @@ async def registrar_miembro_slash(
         try:
             await usuario.add_roles(banda, reason=f"Registrado manualmente por {interaction.user}")
         except discord.Forbidden:
-            await interaction.response.send_message("⚠️ Registrado en BD pero no tengo permisos para asignar el rol.", ephemeral=True)
+            await interaction.response.send_message(format_message("Registrado en BD pero no tengo permisos para asignar el rol"), ephemeral=True)
             return
 
-    await interaction.response.send_message(
-        f"✅ {usuario.mention} registrado como miembro de {banda.mention} (entrada: hace {dias_atras} días)."
-    )
+    await interaction.response.send_message(format_message(
+        f"{usuario.mention} registrado como **miembro** de {banda.mention}",
+        f"Fecha de entrada: hace {dias_atras} días",
+        f"Confirmado por: {interaction.user.mention}",
+    ))
 
 
 @bot.tree.command(name="registrar_jefe", description="[Staff] Registra manualmente a un jefe existente")
@@ -944,21 +992,20 @@ async def registrar_jefe_slash(
     dias_atras: int = 0,
 ):
     if not is_staff(interaction.user):
-        await interaction.response.send_message("⛔ Solo admins/staff pueden usar este comando.", ephemeral=True)
+        await interaction.response.send_message(format_message("Solo admins/staff pueden usar este comando"), ephemeral=True)
         return
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
+        await interaction.response.send_message(format_message(f"{banda.mention} no es una banda configurada"), ephemeral=True)
         return
 
     active = await get_active_membership(usuario.id, interaction.guild.id, role_kind="leader")
     if active and active["band_role_id"] == banda.id:
-        await interaction.response.send_message(f"⚠️ {usuario.mention} ya es jefe de {banda.mention}.", ephemeral=True)
+        await interaction.response.send_message(format_message(f"{usuario.mention} ya es **Jefe** de {banda.mention}"), ephemeral=True)
         return
     if active:
-        await interaction.response.send_message(
-            f"⚠️ {usuario.mention} ya es jefe de otra banda (<@&{active['band_role_id']}>).",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(format_message(
+            f"{usuario.mention} ya es **Jefe** de otra banda (<@&{active['band_role_id']}>)"
+        ), ephemeral=True)
         return
 
     joined_at = datetime.now(timezone.utc) - timedelta(days=dias_atras)
@@ -974,22 +1021,24 @@ async def registrar_jefe_slash(
         try:
             await usuario.add_roles(leader_role, reason=f"Registrado manualmente por {interaction.user}")
         except discord.Forbidden:
-            await interaction.response.send_message("⚠️ Registrado en BD pero no tengo permisos para asignar el rol.", ephemeral=True)
+            await interaction.response.send_message(format_message("Registrado en BD pero no tengo permisos para asignar el rol"), ephemeral=True)
             return
 
-    await interaction.response.send_message(
-        f"👑 {usuario.mention} registrado como jefe de {banda.mention} (entrada: hace {dias_atras} días)."
-    )
+    await interaction.response.send_message(format_message(
+        f"{usuario.mention} registrado como **Jefe** de {banda.mention}",
+        f"Fecha de entrada: hace {dias_atras} días",
+        f"Confirmado por: {interaction.user.mention}",
+    ))
 
 
 @bot.tree.command(name="desmantelacion", description="[Staff] Desmantela una banda y aplica cooldown de 7 días a todos")
 @app_commands.describe(banda="La banda a desmantelar")
 async def desmantelacion_slash(interaction: discord.Interaction, banda: discord.Role):
     if not is_staff(interaction.user):
-        await interaction.response.send_message("⛔ Solo admins/staff pueden usar este comando.", ephemeral=True)
+        await interaction.response.send_message(format_message("Solo admins/staff pueden usar este comando"), ephemeral=True)
         return
     if banda.id not in MEMBER_TO_LEADER_ROLE:
-        await interaction.response.send_message(f"⚠️ {banda.mention} no es una banda configurada.", ephemeral=True)
+        await interaction.response.send_message(format_message(f"{banda.mention} no es una banda configurada"), ephemeral=True)
         return
 
     # Confirmación con un botón
@@ -1016,19 +1065,18 @@ async def desmantelacion_slash(interaction: discord.Interaction, banda: discord.
             await btn_interaction.response.defer()
 
     view = ConfirmView()
-    await interaction.response.send_message(
-        f"⚠️ **CONFIRMACIÓN REQUERIDA**\n"
-        f"Vas a desmantelar **{banda.name}**:\n"
-        f"• Expulsa a TODOS los miembros y jefes (incluido el dueño)\n"
-        f"• Cooldown de **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a CUALQUIER banda\n"
-        f"• Esta acción NO se puede deshacer\n\n"
-        f"Tienes 30 segundos para confirmar.",
-        view=view,
-    )
+    await interaction.response.send_message(format_message(
+        "**CONFIRMACIÓN REQUERIDA**",
+        f"Vas a desmantelar **{banda.name}**:",
+        "Expulsa a TODOS los miembros y Jefes (incluido el dueño)",
+        f"Cooldown de **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a CUALQUIER banda",
+        "Esta acción NO se puede deshacer",
+        "Tienes 30 segundos para confirmar",
+    ), view=view)
 
     await view.wait()
     if not view.confirmed:
-        await interaction.followup.send("❌ Desmantelación cancelada.")
+        await interaction.followup.send(format_message("Desmantelación cancelada"))
         return
 
     async with bot.db_pool.acquire() as conn:
@@ -1038,7 +1086,7 @@ async def desmantelacion_slash(interaction: discord.Interaction, banda: discord.
         )
 
     if not rows:
-        await interaction.followup.send(f"⚠️ {banda.mention} no tiene miembros ni jefes activos.")
+        await interaction.followup.send(format_message(f"{banda.mention} no tiene miembros ni Jefes activos"))
         return
 
     affected_user_ids = {row["user_id"] for row in rows}
@@ -1072,15 +1120,15 @@ async def desmantelacion_slash(interaction: discord.Interaction, banda: discord.
         )
         expelled_count += 1
 
-    msg = (
-        f"💥 **{banda.name} ha sido desmantelada.**\n"
-        f"• Personas expulsadas: **{expelled_count}**\n"
-        f"• Cooldown aplicado: **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a cualquier banda\n"
-        f"• Ejecutado por: {interaction.user.mention}"
-    )
+    msg_lines = [
+        f"**{banda.name}** ha sido desmantelada",
+        f"Personas expulsadas: **{expelled_count}**",
+        f"Cooldown aplicado: **{DISBANDMENT_COOLDOWN_DAYS} días** para unirse a cualquier banda",
+        f"Confirmado por: {interaction.user.mention}",
+    ]
     if role_errors:
-        msg += f"\n⚠️ No pude quitar el rol a {role_errors} usuarios (problema de permisos)."
-    await interaction.followup.send(msg)
+        msg_lines.append(f"No pude quitar el rol a {role_errors} usuarios (problema de permisos)")
+    await interaction.followup.send(format_message(*msg_lines))
 
 
 # ===== Main =====
