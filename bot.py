@@ -66,7 +66,7 @@ BANDS_CONFIG: list[dict] = [
         "name":        "Poison Crew",
         "leader_role": 1194817495211720724,
         "member_role": 1183559269476479038,
-        "capacity":    15,
+        "capacity":    17,
         "owner_id":    1041454182344949771,
  },
      {
@@ -143,14 +143,14 @@ BANDS_CONFIG: list[dict] = [
          "name":        "Underblood",
          "leader_role": 1283255788139184188,
          "member_role": 1283255795122831410,
-         "capacity":    15,
+         "capacity":    17,
          "owner_id":    1006279091563008092,
      },
      {
          "name":        "C´est La Mort",
          "leader_role": 1355029136783179786,
          "member_role": 1355028215000858624,
-         "capacity":    15,
+         "capacity":    17,
          "owner_id":    1345387913260568637,
      },
      {
