@@ -105,13 +105,6 @@ BANDS_CONFIG: list[dict] = [
          "owner_id":    430830587641856021,
      },
      {
-         "name":        "Faze",
-         "leader_role": 1213885972148658226,
-         "member_role": 1213885841223712818,
-         "capacity":    12,
-         "owner_id":    702329561622249535,
-     },
-     {
          "name":        "Esex Gang",
          "leader_role": 1256718554422706246,
          "member_role": 1256718594067140648,
@@ -243,6 +236,21 @@ CREATE TABLE IF NOT EXISTS disbandment_cooldown (
 
 CREATE INDEX IF NOT EXISTS idx_disbandment_user
     ON disbandment_cooldown (guild_id, user_id, expires_at DESC);
+
+-- Cupos extra que admins pueden otorgar a las bandas (permanentes o temporales)
+CREATE TABLE IF NOT EXISTS extra_capacity (
+    id           BIGSERIAL PRIMARY KEY,
+    guild_id     BIGINT NOT NULL,
+    band_role_id BIGINT NOT NULL,
+    amount       INTEGER NOT NULL,
+    expires_at   TIMESTAMPTZ,            -- NULL = permanente
+    granted_by   BIGINT NOT NULL,
+    granted_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    note         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_extra_capacity_band
+    ON extra_capacity (guild_id, band_role_id);
 """
 
 
@@ -354,6 +362,61 @@ async def get_active_disbandment_cooldown(user_id: int, guild_id: int):
             """,
             guild_id, user_id,
         )
+
+
+async def get_extra_capacity(guild_id: int, band_role_id: int) -> int:
+    """Devuelve la suma total de cupos extra ACTIVOS (no expirados) de una banda."""
+    async with bot.db_pool.acquire() as conn:
+        result = await conn.fetchval(
+            """
+            SELECT COALESCE(SUM(amount), 0) FROM extra_capacity
+            WHERE guild_id = $1 AND band_role_id = $2
+              AND (expires_at IS NULL OR expires_at > NOW())
+            """,
+            guild_id, band_role_id,
+        )
+    return int(result or 0)
+
+
+async def list_extra_capacity(guild_id: int, band_role_id: int):
+    """Lista todos los cupos extras activos de una banda."""
+    async with bot.db_pool.acquire() as conn:
+        return await conn.fetch(
+            """
+            SELECT id, amount, expires_at, granted_by, granted_at, note
+            FROM extra_capacity
+            WHERE guild_id = $1 AND band_role_id = $2
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY granted_at DESC
+            """,
+            guild_id, band_role_id,
+        )
+
+
+async def add_extra_capacity(guild_id: int, band_role_id: int, amount: int, days: int | None, granted_by: int, note: str | None = None) -> int:
+    """Añade cupos extra. Si days es None, son permanentes. Devuelve el id del registro."""
+    expires_at = None
+    if days is not None:
+        expires_at = datetime.now(timezone.utc) + timedelta(days=days)
+    async with bot.db_pool.acquire() as conn:
+        return await conn.fetchval(
+            """
+            INSERT INTO extra_capacity (guild_id, band_role_id, amount, expires_at, granted_by, note)
+            VALUES ($1, $2, $3, $4, $5, $6) RETURNING id
+            """,
+            guild_id, band_role_id, amount, expires_at, granted_by, note,
+        )
+
+
+async def remove_extra_capacity(extra_id: int, guild_id: int) -> bool:
+    """Borra un registro de cupo extra. Devuelve True si se borró."""
+    async with bot.db_pool.acquire() as conn:
+        result = await conn.execute(
+            "DELETE FROM extra_capacity WHERE id = $1 AND guild_id = $2",
+            extra_id, guild_id,
+        )
+    # asyncpg devuelve algo como 'DELETE 1' o 'DELETE 0'
+    return result.endswith("1")
 
 
 async def count_weekly_member_assignments(guild_id: int, band_role_id: int) -> int:
@@ -543,12 +606,15 @@ async def check_member_assign(user_id: int, guild_id: int, target_band_role_id: 
 
     capacity = BAND_CAPACITY.get(target_band_role_id)
     if capacity is not None:
+        extra = await get_extra_capacity(guild_id, target_band_role_id)
+        effective_capacity = capacity + extra
         active_total = await count_active_total_in_band(guild_id, target_band_role_id)
-        if active_total >= capacity:
+        if active_total >= effective_capacity:
+            extra_note = f" (incluye {extra} extra)" if extra > 0 else ""
             return False, [
                 "No puedes ingresar a esta OD",
                 "Motivo: Esta banda está llena, debe ser expulsado alguien primero",
-                f"Estado actual: {active_total}/{capacity} integrantes",
+                f"Estado actual: {active_total}/{effective_capacity} integrantes{extra_note}",
             ]
 
     return True, []
@@ -687,13 +753,10 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 await handle_assign_member(channel, target, band_role, reactor, leader, bypass=bypass)
         else:
             # Quitar:
-            #   - 'degradar'/'bajar' -> degrada a miembro (mantiene en la banda, no consume cupo)
-            #   - 'jefe' -> solo quita el rol de jefe (sin asignar miembro)
+            #   - 'jefe' o 'degradar'/'bajar' -> degrada a miembro
             #   - sin palabras especiales -> expulsión total (jefe y miembro)
-            if demote_request:
+            if leader_request or demote_request:
                 await handle_demote(channel, target, band_role, reactor, leader)
-            elif leader_request:
-                await handle_remove_leader_only(channel, target, band_role, reactor, leader)
             else:
                 await handle_remove_full(channel, target, band_role, reactor, leader)
 
@@ -836,49 +899,6 @@ async def handle_remove_full(channel, member, band_role, reactor, leader):
     ))
 
 
-async def handle_remove_leader_only(channel, member, band_role, reactor, leader):
-    """Solo quita el rol de jefe (sin degradar ni asignar miembro). El usuario queda sin nada."""
-    owner_id = BAND_OWNER.get(band_role.id)
-    if owner_id is None:
-        await channel.send(format_message(f"{band_role.mention} no tiene **dueño** configurado"))
-        return
-    if leader.id != owner_id:
-        await channel.send(format_message(
-            f"Solo el **dueño** de {band_role.mention} (<@{owner_id}>) puede quitar el rango de **Jefe**"
-        ))
-        return
-
-    if member.id == owner_id:
-        await channel.send(format_message(f"No se le puede quitar el rango al **dueño** ({member.mention})"))
-        return
-
-    active = await get_active_membership(member.id, channel.guild.id, role_kind="leader")
-    if not active or active["band_role_id"] != band_role.id:
-        await channel.send(format_message(f"{member.mention} no es **Jefe** activo de {band_role.mention}"))
-        return
-
-    leader_role_id = MEMBER_TO_LEADER_ROLE.get(band_role.id)
-    leader_role = channel.guild.get_role(leader_role_id) if leader_role_id else None
-
-    # Solo quitar el rol de jefe, no asignar nada
-    if leader_role and leader_role in member.roles:
-        try:
-            await member.remove_roles(leader_role, reason=f"Jefe removido por {reactor} (solicitó: {leader})")
-        except discord.Forbidden:
-            await channel.send(format_message("No tengo permisos para remover el rol de **Jefe**"))
-            return
-
-    await close_membership(active["id"])
-
-    leader_count = await count_active_leaders(channel.guild.id, band_role.id)
-    await channel.send(format_message(
-        f"{member.mention} Ya no es Jefe de {band_role.mention}",
-        f"Solicitado por {leader.mention}",
-        f"Confirmado por {reactor.mention}",
-        f"Estado actual: Jefes activos {leader_count}/{MAX_LEADERS_PER_BAND}",
-    ))
-
-
 async def handle_demote(channel, member, band_role, reactor, leader):
     """Degrada de jefe a miembro: quita rol de jefe, asigna rol de miembro.
     NO consume cupo semanal porque es un cambio de rol, no una entrada nueva."""
@@ -994,13 +1014,18 @@ async def banda_slash(interaction: discord.Interaction, banda: discord.Role):
     weekly = await count_weekly_member_assignments(interaction.guild.id, banda.id)
     leaders = await count_active_leaders(interaction.guild.id, banda.id)
     total = await count_active_total_in_band(interaction.guild.id, banda.id)
-    capacity = BAND_CAPACITY.get(banda.id, "?")
+    capacity = BAND_CAPACITY.get(banda.id, 0)
+    extra = await get_extra_capacity(interaction.guild.id, banda.id)
+    effective_capacity = capacity + extra
     owner_id = BAND_OWNER.get(banda.id)
     owner_line = f"**Dueño**: <@{owner_id}>" if owner_id else "**Dueño**: no configurado"
+    capacity_line = f"Personas activas: {total}/{effective_capacity} integrantes"
+    if extra > 0:
+        capacity_line += f" (base {capacity} + {extra} extra)"
     await interaction.response.send_message(format_message(
         f"**{banda.name}**",
         owner_line,
-        f"Personas activas: {total}/{capacity}",
+        capacity_line,
         f"Jefes activos: {leaders}/{MAX_LEADERS_PER_BAND}",
         f"Nuevos miembros esta semana: {weekly}/{WEEKLY_MEMBER_LIMIT}",
     ))
@@ -1206,6 +1231,109 @@ async def desmantelacion_slash(interaction: discord.Interaction, banda: discord.
     if role_errors:
         msg_lines.append(f"No pude quitar el rol a {role_errors} usuarios (problema de permisos)")
     await interaction.followup.send(format_message(*msg_lines))
+
+
+# ===== Comandos de cupos extra =====
+
+@bot.tree.command(name="cupo_extra", description="[Staff] Añade cupos extra a una banda (permanentes o temporales)")
+@app_commands.describe(
+    banda="La banda a la que añadir cupos",
+    cantidad="Cantidad de cupos extra (puede ser negativo para reducir)",
+    dias="Días de duración (deja vacío para que sean permanentes)",
+    nota="Nota opcional sobre por qué se otorgaron",
+)
+async def cupo_extra_slash(
+    interaction: discord.Interaction,
+    banda: discord.Role,
+    cantidad: int,
+    dias: int | None = None,
+    nota: str | None = None,
+):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(format_message("Solo admins/staff pueden usar este comando"), ephemeral=True)
+        return
+    if banda.id not in MEMBER_TO_LEADER_ROLE:
+        await interaction.response.send_message(format_message(f"{banda.mention} no es una banda configurada"), ephemeral=True)
+        return
+    if cantidad == 0:
+        await interaction.response.send_message(format_message("La cantidad no puede ser 0"), ephemeral=True)
+        return
+    if dias is not None and dias <= 0:
+        await interaction.response.send_message(format_message("Los días deben ser mayores a 0"), ephemeral=True)
+        return
+
+    extra_id = await add_extra_capacity(
+        interaction.guild.id, banda.id, cantidad, dias, interaction.user.id, nota,
+    )
+
+    base_capacity = BAND_CAPACITY.get(banda.id, 0)
+    new_total_extra = await get_extra_capacity(interaction.guild.id, banda.id)
+    effective = base_capacity + new_total_extra
+
+    duration_line = "Duración: **permanente**" if dias is None else f"Duración: **{dias} días**"
+    sign = "+" if cantidad > 0 else ""
+    lines = [
+        f"Cupo extra otorgado a {banda.mention}",
+        f"Cantidad: **{sign}{cantidad}** (ID: {extra_id})",
+        duration_line,
+        f"Capacidad nueva: {base_capacity} base + {new_total_extra} extra = **{effective}** integrantes",
+        f"Otorgado por: {interaction.user.mention}",
+    ]
+    if nota:
+        lines.append(f"Nota: {nota}")
+    await interaction.response.send_message(format_message(*lines))
+
+
+@bot.tree.command(name="cupos_extras_lista", description="Lista los cupos extras activos de una banda")
+@app_commands.describe(banda="La banda a consultar")
+async def cupos_extras_lista_slash(interaction: discord.Interaction, banda: discord.Role):
+    if banda.id not in MEMBER_TO_LEADER_ROLE:
+        await interaction.response.send_message(format_message(f"{banda.mention} no es una banda configurada"), ephemeral=True)
+        return
+
+    rows = await list_extra_capacity(interaction.guild.id, banda.id)
+    if not rows:
+        await interaction.response.send_message(format_message(
+            f"**{banda.name}** no tiene cupos extras activos",
+        ))
+        return
+
+    lines = [f"**Cupos extras activos de {banda.name}:**"]
+    for row in rows:
+        sign = "+" if row["amount"] > 0 else ""
+        if row["expires_at"] is None:
+            duration = "permanente"
+        else:
+            remaining = row["expires_at"] - datetime.now(timezone.utc)
+            duration = f"{_format_remaining(remaining)} restantes"
+        note_part = f" - Nota: {row['note']}" if row["note"] else ""
+        lines.append(
+            f"ID `{row['id']}`: {sign}{row['amount']} cupos · {duration} · "
+            f"otorgado por <@{row['granted_by']}>{note_part}"
+        )
+    total = sum(r["amount"] for r in rows)
+    lines.append(f"**Total cupos extra activos: {total}**")
+    await interaction.response.send_message(format_message(*lines))
+
+
+@bot.tree.command(name="cupo_extra_quitar", description="[Staff] Elimina un cupo extra por su ID")
+@app_commands.describe(extra_id="ID del cupo extra (lo ves con /cupos_extras_lista)")
+async def cupo_extra_quitar_slash(interaction: discord.Interaction, extra_id: int):
+    if not is_staff(interaction.user):
+        await interaction.response.send_message(format_message("Solo admins/staff pueden usar este comando"), ephemeral=True)
+        return
+
+    deleted = await remove_extra_capacity(extra_id, interaction.guild.id)
+    if not deleted:
+        await interaction.response.send_message(format_message(
+            f"No se encontró ningún cupo extra con ID `{extra_id}`",
+        ), ephemeral=True)
+        return
+
+    await interaction.response.send_message(format_message(
+        f"Cupo extra ID `{extra_id}` eliminado",
+        f"Eliminado por: {interaction.user.mention}",
+    ))
 
 
 # ===== Main =====
