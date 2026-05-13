@@ -172,7 +172,7 @@ BANDS_CONFIG: list[dict] = [
          "leader_role": 1241895748447244298,
          "member_role": 1241895614988423310,
          "capacity":    12,
-         "owner_id":    1151562055896289320,
+         "owner_id":    376897121795833856,
      },
 ]
 
