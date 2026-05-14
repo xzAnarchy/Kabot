@@ -1465,6 +1465,80 @@ async def cupo_extra_quitar_slash(interaction: discord.Interaction, extra_id: in
     ))
 
 
+# ===== Comandos de actos delictivos =====
+
+ACTO_DELICTIVO_MARKER = "acto delictivo"
+FLEECA_PATTERN = re.compile(r"\b(fleeca|flecca|fleecca)\b", re.IGNORECASE)
+
+
+@bot.tree.command(name="contar_actos", description="Cuenta los actos delictivos reportados en un canal desde una fecha")
+@app_commands.describe(
+    desde="Fecha desde la que contar (formato: YYYY-MM-DD, ej: 2026-04-01)",
+    canal="Canal donde están los reportes (por defecto, este canal)",
+)
+async def contar_actos_slash(
+    interaction: discord.Interaction,
+    desde: str,
+    canal: discord.TextChannel | None = None,
+):
+    # Validar fecha
+    try:
+        from_date = datetime.strptime(desde, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        await interaction.response.send_message(format_message(
+            "Formato de fecha inválido",
+            "Usa el formato YYYY-MM-DD (ejemplo: 2026-04-01)",
+        ), ephemeral=True)
+        return
+
+    target_channel = canal or interaction.channel
+
+    # Defer porque la lectura del historial puede tardar
+    await interaction.response.defer(thinking=True)
+
+    total_acts = 0
+    fleeca_count = 0
+    other_count = 0
+    score = 0.0
+
+    try:
+        async for message in target_channel.history(after=from_date, limit=None, oldest_first=True):
+            if message.author.bot:
+                continue
+            content_lower = message.content.lower()
+            # Solo contar mensajes que contengan el marcador "Acto delictivo:"
+            if ACTO_DELICTIVO_MARKER not in content_lower:
+                continue
+
+            total_acts += 1
+            if FLEECA_PATTERN.search(message.content):
+                fleeca_count += 1
+                score += 0.5
+            else:
+                other_count += 1
+                score += 1.0
+    except discord.Forbidden:
+        await interaction.followup.send(format_message(
+            f"No tengo permisos para leer el historial de {target_channel.mention}",
+        ), ephemeral=True)
+        return
+
+    # Formatear el score sin .0 si es entero
+    if score == int(score):
+        score_str = str(int(score))
+    else:
+        score_str = f"{score:.1f}"
+
+    await interaction.followup.send(format_message(
+        f"**Actos delictivos en {target_channel.mention}**",
+        f"Desde: **{desde}** hasta hoy",
+        f"Total de actos: **{total_acts}**",
+        f"Fleeca (0.5 c/u): {fleeca_count}",
+        f"Otros (1.0 c/u): {other_count}",
+        f"Puntuación total: **{score_str}**",
+    ))
+
+
 # ===== Main =====
 async def main():
     bot.db_pool = await init_db()
